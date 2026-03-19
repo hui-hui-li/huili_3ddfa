@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D 人脸重建与注意力分析平台</title>
+  <link rel="stylesheet" href="/styles.css?v=20260319-2" />
+</head>
+<body>
+  <div class="bg"></div>
+  <main class="container">
+    <section class="panel auth-panel" id="auth-panel">
+      <h1>3D 人脸重建与注意力分析平台</h1>
+      <p class="muted">用户管理 + 照片/视频管理 + 3DDFA 重建 + 头姿态注意力分析</p>
+
+      <div class="tabs">
+        <button id="tab-login" class="tab active">登录</button>
+        <button id="tab-register" class="tab">注册</button>
+      </div>
+
+      <form id="login-form" class="form">
+        <label>用户名或邮箱</label>
+        <input name="username_or_email" placeholder="请输入用户名或邮箱" required />
+        <label>密码</label>
+        <input type="password" name="password" placeholder="请输入密码" required />
+        <button type="submit">登录</button>
+      </form>
+
+      <form id="register-form" class="form hidden">
+        <label>用户名</label>
+        <input name="username" placeholder="至少 3 个字符" required />
+        <label>邮箱</label>
+        <input type="email" name="email" placeholder="请输入邮箱" required />
+        <label>密码</label>
+        <input type="password" name="password" placeholder="至少 6 个字符" required />
+        <button type="submit">注册</button>
+      </form>
+
+      <div id="auth-msg" class="msg"></div>
+    </section>
+
+    <section class="panel app-panel hidden" id="app-panel">
+      <div class="topbar">
+        <div>
+          <h2>控制台</h2>
+          <p id="user-info" class="muted"></p>
+        </div>
+        <button id="logout-btn" class="danger">退出登录</button>
+      </div>
+
+      <nav id="app-nav" class="app-nav" aria-label="应用导航">
+        <button class="app-nav-btn active" data-view="view-media">媒体中心</button>
+        <button class="app-nav-btn" data-view="view-jobs">重建任务</button>
+        <button class="app-nav-btn" data-view="view-photo-analysis">照片分析</button>
+        <button class="app-nav-btn" data-view="view-attention">注意力分析</button>
+        <button class="app-nav-btn" data-view="view-profile">个人资料</button>
+        <button id="admin-nav-btn" class="app-nav-btn hidden" data-view="view-admin">管理员</button>
+      </nav>
+
+      <div id="app-msg" class="msg"></div>
+
+      <section id="view-media" class="app-view">
+        <div class="grid">
+          <article class="card">
+            <h3>上传照片</h3>
+            <form id="photo-form" class="form inline-form">
+              <input type="file" id="photo-file" accept="image/*" required />
+              <select id="photo-upload-scenario">
+                <option value="classroom">课堂场景</option>
+                <option value="exam">考试场景</option>
+                <option value="driving">驾驶场景</option>
+              </select>
+              <button type="submit">上传并重建</button>
+            </form>
+          </article>
+
+          <article class="card">
+            <h3>上传视频</h3>
+            <form id="video-form" class="form inline-form">
+              <input type="file" id="video-file" accept="video/*" required />
+              <select id="video-upload-scenario">
+                <option value="classroom">课堂场景</option>
+                <option value="exam">考试场景</option>
+                <option value="driving">驾驶场景</option>
+              </select>
+              <button type="submit">上传并重建</button>
+            </form>
+          </article>
+        </div>
+
+        <article class="card">
+          <div class="section-head">
+            <h3>我的媒体</h3>
+            <div class="inline-actions">
+              <button id="batch-rebuild-media" class="small secondary" disabled>批量发起重建</button>
+              <button id="batch-delete-media" class="small warn" disabled>批量删除</button>
+              <button id="refresh-media">刷新</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th><input type="checkbox" id="media-select-all" /></th>
+                  <th>ID</th>
+                  <th>类型</th>
+                  <th>文件名</th>
+                  <th>大小</th>
+                  <th>默认场景</th>
+                  <th>上传时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="media-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="view-jobs" class="app-view hidden">
+        <article class="card">
+          <div class="section-head">
+            <h3>重建任务</h3>
+            <div class="inline-actions">
+              <button id="batch-cancel-jobs" class="small secondary" disabled>批量终止任务</button>
+              <button id="batch-delete-jobs" class="small warn" disabled>批量删除任务</button>
+              <button id="refresh-jobs">刷新</button>
+            </div>
+          </div>
+          <form id="jobs-filter-form" class="form inline-form">
+            <select id="jobs-status-filter">
+              <option value="">全部状态</option>
+              <option value="queued">排队中</option>
+              <option value="running">进行中</option>
+              <option value="completed">已完成</option>
+              <option value="failed">失败</option>
+              <option value="cancelled">已取消</option>
+            </select>
+            <select id="jobs-scenario-filter">
+              <option value="">全部场景</option>
+              <option value="classroom">课堂</option>
+              <option value="exam">考试</option>
+              <option value="driving">驾驶</option>
+            </select>
+            <input id="jobs-created-from" type="date" />
+            <input id="jobs-created-to" type="date" />
+            <input id="jobs-search-filter" placeholder="搜索任务名称或任务ID" />
+            <button type="submit" class="small secondary">搜索</button>
+            <button type="button" id="jobs-search-clear" class="small secondary">清空</button>
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th><input type="checkbox" id="jobs-select-all" /></th>
+                  <th>任务ID</th>
+                  <th>任务名称</th>
+                  <th>媒体ID</th>
+                  <th>状态</th>
+                  <th>场景</th>
+                  <th>进度</th>
+                  <th>关键帧</th>
+                  <th>创建时间</th>
+                  <th>错误信息</th>
+                  <th>结果</th>
+                  <th>任务操作</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="view-photo-analysis" class="app-view hidden">
+        <article class="card">
+          <h3>照片分析</h3>
+          <p class="muted">上传单张照片后，直接输出头姿态与注意力分析结果。单人模式支持跨次平滑，多人模式适合课堂抬头率统计。</p>
+          <div class="feature-list muted">
+            <span>单张照片头姿态分析</span>
+            <span>单人照片专注度评分</span>
+            <span>多人照片抬头率统计</span>
+            <span>驾驶分心照片判别</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="section-head">
+            <h3>照片分析结果</h3>
+          </div>
+          <form id="realtime-attention-form" class="form inline-form">
+            <input type="file" id="attention-frame-file" accept="image/*" required />
+            <select id="attention-scenario">
+              <option value="classroom">课堂场景</option>
+              <option value="exam">考试场景</option>
+              <option value="driving">驾驶场景</option>
+            </select>
+            <select id="attention-mode">
+              <option value="single">单人分析</option>
+              <option value="multi">多人分析</option>
+            </select>
+            <input id="attention-session-id" placeholder="会话ID（可选）" />
+            <button type="submit">分析</button>
+          </form>
+          <p id="realtime-attention-summary" class="muted" style="margin-top:10px;">尚未分析</p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>人脸</th>
+                  <th>偏航角</th>
+                  <th>俯仰角</th>
+                  <th>翻滚角</th>
+                  <th>专注度</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="realtime-attention-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="view-attention" class="app-view hidden">
+        <article class="card">
+          <h3>任务注意力分析</h3>
+          <p class="muted">面向已完成的重建任务，查看视频时序注意力结果、曲线和 CSV 导出。</p>
+          <div class="feature-list muted">
+            <span>视频任务时序分析</span>
+            <span>专注度曲线</span>
+            <span>课堂/考试/驾驶三场景评分</span>
+            <span>CSV 导出</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="section-head">
+            <h3>任务注意力结果</h3>
+            <button id="download-attention-csv" class="small secondary" disabled>下载CSV</button>
+          </div>
+          <form id="attention-job-form" class="form inline-form">
+            <select id="attention-job-select" required>
+              <option value="">选择任务名称加载分析</option>
+            </select>
+            <button type="submit">加载</button>
+          </form>
+          <p id="attention-summary-text" class="muted" style="margin-top:10px;">尚未加载任务分析</p>
+          <div class="curve-wrap">
+            <canvas id="attention-curve-canvas" class="curve-canvas" height="220"></canvas>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>帧号</th>
+                  <th>对应图像</th>
+                  <th>偏航角</th>
+                  <th>俯仰角</th>
+                  <th>翻滚角</th>
+                  <th>专注度</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="attention-timeline-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="view-profile" class="app-view hidden">
+        <article class="card">
+          <h3>个人资料</h3>
+          <form id="profile-form" class="form profile-form">
+            <label>
+              用户名
+              <input id="profile-username" name="username" placeholder="至少 3 个字符" required />
+            </label>
+            <label>
+              邮箱
+              <input id="profile-email" name="email" type="email" placeholder="请输入邮箱" required />
+            </label>
+            <button type="submit">保存资料</button>
+          </form>
+        </article>
+
+        <article class="card">
+          <h3>修改密码</h3>
+          <form id="change-password-form" class="form inline-form">
+            <input type="password" id="old-password" placeholder="旧密码" required />
+            <input type="password" id="new-password" placeholder="新密码（>=6）" required />
+            <button type="submit">更新密码</button>
+          </form>
+        </article>
+
+        <article class="card danger-zone">
+          <h3>注销账号</h3>
+          <p class="muted">注销后会删除当前账号、媒体、重建任务记录和输出文件。若仍有运行中或排队中的任务，需要先终止它们。</p>
+          <form id="delete-account-form" class="form inline-form">
+            <input type="password" id="delete-account-password" placeholder="输入当前密码确认注销" required />
+            <button type="submit" class="danger">注销账号</button>
+          </form>
+        </article>
+      </section>
+
+      <section id="view-admin" class="app-view hidden">
+        <article class="card hidden" id="admin-panel">
+          <div class="section-head">
+            <h3>管理员面板</h3>
+            <button id="refresh-users">刷新用户</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>用户名</th>
+                  <th>邮箱</th>
+                  <th>角色</th>
+                  <th>状态</th>
+                  <th>封禁原因</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="users-body"></tbody>
+            </table>
+          </div>
+
+          <div class="section-head" style="margin-top: 16px;">
+            <h3>管理员操作审计日志</h3>
+            <button id="refresh-audit-logs">刷新日志</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>管理员</th>
+                  <th>动作</th>
+                  <th>目标用户</th>
+                  <th>详情</th>
+                </tr>
+              </thead>
+              <tbody id="audit-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </section>
+  </main>
+
+  <section id="frame-preview-modal" class="modal hidden">
+    <div class="modal-content">
+      <div class="section-head">
+        <h3>逐帧在线预览</h3>
+        <button id="close-frame-modal" class="danger">关闭</button>
+      </div>
+      <p id="frame-preview-meta" class="muted"></p>
+      <div class="preview-controls">
+        <button id="prev-page" class="small secondary">上一页</button>
+        <span id="page-info">页码 -</span>
+        <button id="next-page" class="small secondary">下一页</button>
+        <button id="prev-frame" class="small">上一帧</button>
+        <button id="next-frame" class="small">下一帧</button>
+        <button id="play-frames" class="small">自动播放</button>
+        <label class="muted">播放帧率
+          <input id="frame-playback-fps" type="range" min="1" max="24" value="8" />
+        </label>
+      </div>
+      <div class="preview-stage">
+        <img id="frame-preview-image" alt="frame preview" />
+      </div>
+      <p id="frame-preview-status" class="muted"></p>
+      <p id="frame-preview-detail" class="muted"></p>
+    </div>
+  </section>
+
+  <section id="image-preview-modal" class="modal hidden">
+    <div class="modal-content">
+      <div class="section-head">
+        <h3 id="image-preview-title">关键帧在线预览</h3>
+        <button id="close-image-modal" class="danger">关闭</button>
+      </div>
+      <p id="image-preview-meta" class="muted"></p>
+      <div class="preview-stage">
+        <img id="image-preview-image" alt="keyframe preview" />
+      </div>
+    </div>
+  </section>
+
+  <script src="/app.js?v=20260319-2"></script>
+</body>
+</html>

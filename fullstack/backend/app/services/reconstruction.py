@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import zipfile
 from pathlib import Path
@@ -112,36 +113,97 @@ def _interpolate_pose(prev_pose: Dict[str, float], blend: float = 0.1) -> Dict[s
     }
 
 
+def _pose_matches_scenario(yaw: float, pitch: float, roll: float, scenario: str) -> bool:
+    key = _scenario_key(scenario)
+    cfg = SCENARIO_CONFIG[key]
+    abs_yaw = abs(float(yaw))
+    abs_pitch = abs(float(pitch))
+    abs_roll = abs(float(roll))
+    pitch_value = float(pitch)
+
+    if key == "exam":
+        return (
+            abs_pitch >= cfg["pitch_down_warn"]
+            and abs_yaw <= cfg["yaw_severe"] + 28.0
+            and abs_roll <= cfg["roll_severe"] + 10.0
+        )
+    if key == "driving":
+        return (
+            pitch_value < cfg["pitch_down_warn"]
+            and abs_yaw <= cfg["yaw_severe"] + 18.0
+            and abs_roll <= cfg["roll_severe"] + 4.0
+        )
+    return (
+        pitch_value < cfg["pitch_down_warn"]
+        and abs_yaw < cfg["yaw_warn"]
+        and abs_roll < cfg["roll_warn"]
+    )
+
+
 def _attention_from_pose(yaw: float, pitch: float, roll: float, scenario: str) -> Tuple[float, Dict[str, bool]]:
-    cfg = SCENARIO_CONFIG[_scenario_key(scenario)]
+    scenario_key = _scenario_key(scenario)
+    cfg = SCENARIO_CONFIG[scenario_key]
     abs_yaw = abs(yaw)
     abs_pitch = abs(pitch)
     abs_roll = abs(roll)
 
     side_view = abs_yaw >= cfg["yaw_warn"]
-    head_down = pitch >= cfg["pitch_down_warn"]
+    if scenario_key == "exam":
+        head_down = abs_pitch >= cfg["pitch_down_warn"]
+    else:
+        head_down = pitch >= cfg["pitch_down_warn"]
     tilted = abs_roll >= cfg["roll_warn"]
 
     penalty = 0.0
-    if abs_yaw > cfg["yaw_warn"]:
-        penalty += min(35.0, (abs_yaw - cfg["yaw_warn"]) * 1.4)
-    if abs_yaw > cfg["yaw_severe"]:
-        penalty += min(25.0, (abs_yaw - cfg["yaw_severe"]) * 1.0)
 
-    if pitch > cfg["pitch_down_warn"]:
-        penalty += min(35.0, (pitch - cfg["pitch_down_warn"]) * 1.8)
-    if pitch > cfg["pitch_down_severe"]:
-        penalty += min(20.0, (pitch - cfg["pitch_down_severe"]) * 1.3)
-    if -pitch > cfg["pitch_up_warn"]:
-        penalty += min(18.0, (-pitch - cfg["pitch_up_warn"]) * 1.0)
+    if scenario_key == "exam":
+        if abs_pitch < cfg["pitch_down_warn"]:
+            penalty += min(45.0, (cfg["pitch_down_warn"] - abs_pitch) * 2.2)
+        if abs_pitch < cfg["pitch_down_warn"] * 0.5:
+            penalty += min(18.0, (cfg["pitch_down_warn"] * 0.5 - abs_pitch) * 1.8)
+        if abs_yaw > cfg["yaw_severe"] + 18.0:
+            penalty += min(12.0, (abs_yaw - (cfg["yaw_severe"] + 18.0)) * 0.7)
+        if abs_yaw > cfg["yaw_severe"] + 30.0:
+            penalty += min(16.0, (abs_yaw - (cfg["yaw_severe"] + 30.0)) * 0.9)
+        if abs_roll > cfg["roll_severe"] + 6.0:
+            penalty += min(10.0, (abs_roll - (cfg["roll_severe"] + 6.0)) * 0.7)
+        if abs_roll > cfg["roll_severe"] + 14.0:
+            penalty += min(12.0, (abs_roll - (cfg["roll_severe"] + 14.0)) * 0.8)
+    elif scenario_key == "driving":
+        if pitch > cfg["pitch_down_warn"]:
+            penalty += min(42.0, (pitch - cfg["pitch_down_warn"]) * 2.1)
+        if pitch > cfg["pitch_down_severe"]:
+            penalty += min(24.0, (pitch - cfg["pitch_down_severe"]) * 1.5)
+        if -pitch > cfg["pitch_up_warn"] + 8.0:
+            penalty += min(10.0, (-pitch - (cfg["pitch_up_warn"] + 8.0)) * 0.7)
+        if abs_yaw > cfg["yaw_severe"] + 12.0:
+            penalty += min(18.0, (abs_yaw - (cfg["yaw_severe"] + 12.0)) * 0.9)
+        if abs_roll > cfg["roll_warn"]:
+            penalty += min(16.0, (abs_roll - cfg["roll_warn"]) * 0.9)
+        if abs_roll > cfg["roll_severe"]:
+            penalty += min(12.0, (abs_roll - cfg["roll_severe"]) * 0.8)
+        if head_down:
+            penalty += 6.0
+    else:
+        if abs_yaw > cfg["yaw_warn"]:
+            penalty += min(35.0, (abs_yaw - cfg["yaw_warn"]) * 1.4)
+        if abs_yaw > cfg["yaw_severe"]:
+            penalty += min(25.0, (abs_yaw - cfg["yaw_severe"]) * 1.0)
 
-    if abs_roll > cfg["roll_warn"]:
-        penalty += min(24.0, (abs_roll - cfg["roll_warn"]) * 1.2)
-    if abs_roll > cfg["roll_severe"]:
-        penalty += min(14.0, (abs_roll - cfg["roll_severe"]) * 1.0)
+        if pitch > cfg["pitch_down_warn"]:
+            penalty += min(35.0, (pitch - cfg["pitch_down_warn"]) * 1.8)
+        if pitch > cfg["pitch_down_severe"]:
+            penalty += min(20.0, (pitch - cfg["pitch_down_severe"]) * 1.3)
+        if -pitch > cfg["pitch_up_warn"]:
+            penalty += min(18.0, (-pitch - cfg["pitch_up_warn"]) * 1.0)
 
-    if head_down and side_view:
-        penalty += 8.0
+        if abs_roll > cfg["roll_warn"]:
+            penalty += min(24.0, (abs_roll - cfg["roll_warn"]) * 1.2)
+        if abs_roll > cfg["roll_severe"]:
+            penalty += min(14.0, (abs_roll - cfg["roll_severe"]) * 1.0)
+
+        if head_down and side_view:
+            penalty += 8.0
 
     score = _clamp(100.0 - penalty, 0.0, 100.0)
     distracted = score < cfg["low_attention_threshold"]
@@ -175,9 +237,11 @@ def _build_attention_summary(
     scenario: str,
     rapid_turn_events: int,
 ) -> Dict[str, object]:
+    scenario_key = _scenario_key(scenario)
+    cfg = SCENARIO_CONFIG[scenario_key]
     if not entries:
         return {
-            "scenario": _scenario_key(scenario),
+            "scenario": scenario_key,
             "fps": round(float(fps), 4),
             "total_frames": 0,
             "detected_frames": int(detected_frames),
@@ -198,33 +262,67 @@ def _build_attention_summary(
 
     scores = [float(e.get("attention_score", 0.0)) for e in entries]
     total = len(entries)
-    low_ratio = sum(1 for s in scores if s < 60.0) / float(total)
+    low_ratio = sum(1 for s in scores if s < cfg["low_attention_threshold"]) / float(total)
     head_down_ratio = sum(1 for e in entries if e.get("head_down")) / float(total)
     side_view_ratio = sum(1 for e in entries if e.get("side_view")) / float(total)
+    posture_match_ratio = sum(
+        1
+        for e in entries
+        if _pose_matches_scenario(
+            _safe_float(e.get("yaw")),
+            _safe_float(e.get("pitch")),
+            _safe_float(e.get("roll")),
+            scenario_key,
+        )
+    ) / float(total)
+    head_up_ratio = sum(1 for e in entries if _safe_float(e.get("pitch")) <= 0.0) / float(total)
+    extreme_side_ratio = sum(
+        1
+        for e in entries
+        if abs(_safe_float(e.get("yaw"))) > (cfg["yaw_severe"] + (10.0 if scenario_key == "driving" else 0.0))
+    ) / float(total)
     rapid_turn_ratio = rapid_turn_events / float(max(1, total))
+    avg_score = float(np.mean(scores))
 
-    exam_focus_score = _clamp(100.0 - (low_ratio * 55.0 + head_down_ratio * 20.0 + side_view_ratio * 25.0) * 100.0, 0.0, 100.0)
-    driving_risk_score = _clamp((low_ratio * 65.0 + rapid_turn_ratio * 20.0 + side_view_ratio * 15.0) * 100.0, 0.0, 100.0)
+    exam_focus_score = _clamp(avg_score * 0.72 + posture_match_ratio * 28.0, 0.0, 100.0)
+    driving_risk_score = _clamp(
+        (100.0 - avg_score) * 0.65
+        + head_down_ratio * 100.0 * 0.25
+        + extreme_side_ratio * 100.0 * 0.10,
+        0.0,
+        100.0,
+    )
 
     warnings: List[str] = []
     if low_ratio > 0.35:
         warnings.append("frequent-low-attention")
-    if head_down_ratio > 0.28:
-        warnings.append("head-down-too-long")
-    if side_view_ratio > 0.3:
-        warnings.append("long-side-view")
-    if rapid_turn_events >= max(3, int(round((total / max(1.0, fps)) / 10.0))):
+    if scenario_key == "exam":
+        if head_up_ratio > 0.35:
+            warnings.append("head-up-too-long")
+        if side_view_ratio > 0.3:
+            warnings.append("long-side-view")
+    elif scenario_key == "driving":
+        if head_down_ratio > 0.18:
+            warnings.append("unsafe-downward-gaze")
+        if extreme_side_ratio > 0.35:
+            warnings.append("long-side-view")
+    else:
+        if head_down_ratio > 0.28:
+            warnings.append("head-down-too-long")
+        if side_view_ratio > 0.3:
+            warnings.append("long-side-view")
+    if scenario_key != "driving" and rapid_turn_events >= max(3, int(round((total / max(1.0, fps)) / 10.0))):
         warnings.append("frequent-head-turn")
-    if driving_risk_score >= 55.0:
+    if scenario_key == "driving" and driving_risk_score >= 55.0:
         warnings.append("driving-distraction-risk")
 
     return {
-        "scenario": _scenario_key(scenario),
+        "scenario": scenario_key,
         "fps": round(float(fps), 4),
         "total_frames": total,
         "detected_frames": int(detected_frames),
         "interpolated_frames": int(interpolated_frames),
-        "avg_attention": round(float(np.mean(scores)), 4),
+        "avg_attention": round(avg_score, 4),
         "min_attention": round(float(min(scores)), 4),
         "max_attention": round(float(max(scores)), 4),
         "low_attention_ratio": round(float(low_ratio), 4),
@@ -232,7 +330,7 @@ def _build_attention_summary(
         "side_view_ratio": round(float(side_view_ratio), 4),
         "rapid_turn_events": int(rapid_turn_events),
         "longest_distracted_frames": int(_longest_true_run(entries, "distracted")),
-        "classroom_head_up_rate": round((1.0 - head_down_ratio) * 100.0, 3),
+        "classroom_head_up_rate": round(posture_match_ratio * 100.0, 3),
         "exam_focus_score": round(float(exam_focus_score), 3),
         "driving_risk_score": round(float(driving_risk_score), 3),
         "warnings": warnings,
@@ -465,6 +563,403 @@ class ThreeDDFARunner:
         ver_lst = self.tddfa.recon_vers(param_lst, roi_box_lst, dense_flag=True)
         return list(param_lst), list(ver_lst)
 
+    @staticmethod
+    def _clamp_face_index(index: int, total: int) -> int:
+        if total <= 0:
+            return 0
+        safe = int(index) if index is not None else 0
+        return max(0, min(total - 1, safe))
+
+    @staticmethod
+    def _box_center(box) -> Tuple[float, float]:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        return (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+    @staticmethod
+    def _normalize_box(box) -> Optional[List[float]]:
+        if box is None:
+            return None
+        try:
+            if len(box) < 4:
+                return None
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            if x2 <= x1 or y2 <= y1:
+                return None
+            return [x1, y1, x2, y2]
+        except Exception:
+            return None
+
+    def _select_target_face_box(
+        self,
+        *,
+        ordered_boxes: List[object],
+        frame_shape,
+        target_face_index: int,
+        previous_target_box: Optional[List[float]],
+        enable_tracking: bool,
+        lock_point: Optional[Tuple[float, float]],
+    ) -> Tuple[object, int]:
+        default_index = self._clamp_face_index(target_face_index, len(ordered_boxes))
+        locked_index = self._select_box_by_lock_point(
+            ordered_boxes=ordered_boxes,
+            frame_shape=frame_shape,
+            lock_point=lock_point,
+        )
+        if locked_index is not None:
+            return ordered_boxes[locked_index], locked_index
+        if not enable_tracking:
+            return ordered_boxes[default_index], default_index
+
+        prev_box = self._normalize_box(previous_target_box)
+        if prev_box is None:
+            return ordered_boxes[default_index], default_index
+
+        h, w = frame_shape[:2]
+        frame_diag = max(1.0, float((w * w + h * h) ** 0.5))
+        best_idx = default_index
+        best_score = -1e9
+
+        prev_center = self._box_center(prev_box)
+        for idx, box in enumerate(ordered_boxes):
+            iou = float(self._box_iou(box, prev_box))
+            cur_center = self._box_center(box)
+            center_dist = float(((cur_center[0] - prev_center[0]) ** 2 + (cur_center[1] - prev_center[1]) ** 2) ** 0.5)
+            center_dist_norm = center_dist / frame_diag
+            area_ratio = self._box_area(box) / float(max(1.0, w * h))
+
+            score = iou * 4.2 - center_dist_norm * 1.5 + area_ratio * 0.35
+            if idx == default_index:
+                score += 0.05
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        candidate = ordered_boxes[best_idx]
+        candidate_iou = float(self._box_iou(candidate, prev_box))
+        candidate_center = self._box_center(candidate)
+        fallback_center = self._box_center(ordered_boxes[default_index])
+        center_dist = float(((candidate_center[0] - prev_center[0]) ** 2 + (candidate_center[1] - prev_center[1]) ** 2) ** 0.5) / frame_diag
+        fallback_dist = float(((fallback_center[0] - prev_center[0]) ** 2 + (fallback_center[1] - prev_center[1]) ** 2) ** 0.5) / frame_diag
+
+        if candidate_iou < 0.03 and center_dist > 0.38 and fallback_dist + 0.08 < center_dist:
+            return ordered_boxes[default_index], default_index
+        return candidate, best_idx
+
+    def _select_box_by_lock_point(
+        self,
+        *,
+        ordered_boxes: List[object],
+        frame_shape,
+        lock_point: Optional[Tuple[float, float]],
+    ) -> Optional[int]:
+        if lock_point is None:
+            return None
+        try:
+            lx = float(lock_point[0])
+            ly = float(lock_point[1])
+        except Exception:
+            return None
+
+        h, w = frame_shape[:2]
+        if h <= 1 or w <= 1:
+            return None
+        lx = _clamp(lx, 0.0, 1.0)
+        ly = _clamp(ly, 0.0, 1.0)
+        px = lx * float(max(1, w - 1))
+        py = ly * float(max(1, h - 1))
+        margin = max(6.0, 0.03 * float(max(w, h)))
+
+        candidate_idx: Optional[int] = None
+        candidate_score = -1e9
+        nearest_idx = 0
+        nearest_dist = 1e9
+
+        for idx, box in enumerate(ordered_boxes):
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+            cx, cy = self._box_center(box)
+            dist = float(((cx - px) ** 2 + (cy - py) ** 2) ** 0.5)
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_idx = idx
+
+            in_box = (x1 - margin) <= px <= (x2 + margin) and (y1 - margin) <= py <= (y2 + margin)
+            if not in_box:
+                continue
+
+            score = self._box_area(box) * 0.0001 - dist
+            if score > candidate_score:
+                candidate_score = score
+                candidate_idx = idx
+
+        if candidate_idx is not None:
+            return candidate_idx
+
+        frame_diag = max(1.0, float((w * w + h * h) ** 0.5))
+        if nearest_dist / frame_diag <= 0.35:
+            return nearest_idx
+        return None
+
+    @staticmethod
+    def _to_xy_points(ver, width: int, height: int) -> np.ndarray:
+        pts = np.asarray(ver, dtype=np.float32)
+        if pts.ndim != 2:
+            raise RuntimeError("Invalid vertex array shape")
+        if pts.shape[0] >= 2:
+            xy = pts[:2, :].T
+        elif pts.shape[1] >= 2:
+            xy = pts[:, :2]
+        else:
+            raise RuntimeError("Vertex array missing XY coordinates")
+
+        max_x = max(0.0, float(width - 1))
+        max_y = max(0.0, float(height - 1))
+        xy[:, 0] = np.clip(xy[:, 0], 0.0, max_x)
+        xy[:, 1] = np.clip(xy[:, 1], 0.0, max_y)
+        return xy.astype(np.float32, copy=False)
+
+    def _triangles(self) -> np.ndarray:
+        tri = np.asarray(self.tddfa.tri)
+        if tri.ndim != 2:
+            raise RuntimeError("Invalid triangle topology")
+        if tri.shape[0] == 3:
+            tri_idx = tri.T
+        elif tri.shape[1] == 3:
+            tri_idx = tri
+        else:
+            raise RuntimeError("Invalid triangle topology shape")
+        return np.asarray(tri_idx, dtype=np.int32)
+
+    def _read_video_frame(self, video_path: str, preferred_index: Optional[int]) -> Tuple[np.ndarray, int]:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open source video.")
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            frame_index = 0
+            if preferred_index is not None and preferred_index >= 0:
+                frame_index = int(preferred_index)
+            elif total > 0:
+                frame_index = max(0, min(total - 1, total // 2))
+
+            if frame_index > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
+                ok, frame = cap.read()
+                frame_index = 0
+            if not ok or frame is None:
+                raise RuntimeError("Failed to decode source video frame.")
+            return frame, frame_index
+        finally:
+            cap.release()
+
+    def extract_face_template(
+        self,
+        *,
+        media_path: str,
+        media_type: str,
+        source_face_index: int = 0,
+        keyframe_index: Optional[int] = None,
+    ) -> Dict[str, object]:
+        self._init_model()
+
+        if media_type == "photo":
+            source_frame = cv2.imread(media_path)
+            selected_frame_index = 0
+        elif media_type == "video":
+            source_frame, selected_frame_index = self._read_video_frame(media_path, keyframe_index)
+        else:
+            raise RuntimeError("Unsupported media type: {}".format(media_type))
+
+        if source_frame is None:
+            raise RuntimeError("Failed to load source media.")
+
+        face_boxes = self._detect_face_boxes(source_frame, profile="photo")
+        if not face_boxes:
+            raise RuntimeError("No face detected in source media.")
+
+        sorted_boxes = sorted(face_boxes, key=self._box_area, reverse=True)
+        selected_index = self._clamp_face_index(source_face_index, len(sorted_boxes))
+        selected_box = sorted_boxes[selected_index]
+        _, source_ver = self._infer_face(source_frame, selected_box)
+
+        return {
+            "media_type": media_type,
+            "frame_index": int(selected_frame_index),
+            "face_index": int(selected_index),
+            "image": source_frame.copy(),
+            "ver": np.asarray(source_ver, dtype=np.float32).copy(),
+        }
+
+    def _swap_face_texture(
+        self,
+        *,
+        source_image: np.ndarray,
+        source_ver,
+        target_frame: np.ndarray,
+        target_ver,
+    ) -> Tuple[np.ndarray, bool]:
+        src_h, src_w = source_image.shape[:2]
+        dst_h, dst_w = target_frame.shape[:2]
+        if src_h <= 1 or src_w <= 1 or dst_h <= 1 or dst_w <= 1:
+            return target_frame.copy(), False
+
+        src_pts = self._to_xy_points(source_ver, src_w, src_h)
+        dst_pts = self._to_xy_points(target_ver, dst_w, dst_h)
+        tri_idx = self._triangles()
+
+        src_img = source_image.astype(np.float32)
+        dst_img = target_frame.astype(np.float32)
+        warped_acc = np.zeros_like(dst_img, dtype=np.float32)
+        weight_acc = np.zeros((dst_h, dst_w), dtype=np.float32)
+        hull_mask = np.zeros((dst_h, dst_w), dtype=np.float32)
+
+        max_src = src_pts.shape[0]
+        max_dst = dst_pts.shape[0]
+
+        for tri in tri_idx:
+            if tri.size != 3:
+                continue
+            if np.any(tri < 0) or np.any(tri >= max_src) or np.any(tri >= max_dst):
+                continue
+
+            src_tri = src_pts[tri]
+            dst_tri = dst_pts[tri]
+            if cv2.contourArea(src_tri) < 0.8 or cv2.contourArea(dst_tri) < 0.8:
+                continue
+
+            r1 = cv2.boundingRect(src_tri)
+            r2 = cv2.boundingRect(dst_tri)
+            if r1[2] <= 1 or r1[3] <= 1 or r2[2] <= 1 or r2[3] <= 1:
+                continue
+
+            x1, y1, w1, h1 = r1
+            x2, y2, w2, h2 = r2
+            src_roi = src_img[y1 : y1 + h1, x1 : x1 + w1]
+            if src_roi.size == 0:
+                continue
+
+            src_rect = src_tri - np.array([x1, y1], dtype=np.float32)
+            dst_rect = dst_tri - np.array([x2, y2], dtype=np.float32)
+            transform = cv2.getAffineTransform(src_rect.astype(np.float32), dst_rect.astype(np.float32))
+            warped = cv2.warpAffine(
+                src_roi,
+                transform,
+                (w2, h2),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+
+            tri_mask = np.zeros((h2, w2), dtype=np.float32)
+            cv2.fillConvexPoly(tri_mask, np.int32(np.round(dst_rect)), 1.0, lineType=cv2.LINE_AA)
+            warped_acc[y2 : y2 + h2, x2 : x2 + w2] += warped * tri_mask[:, :, None]
+            weight_acc[y2 : y2 + h2, x2 : x2 + w2] += tri_mask
+            cv2.fillConvexPoly(hull_mask, np.int32(np.round(dst_tri)), 1.0, lineType=cv2.LINE_AA)
+
+        valid_mask = weight_acc > 1e-6
+        if np.count_nonzero(valid_mask) <= 40:
+            return target_frame.copy(), False
+
+        swapped_face = dst_img.copy()
+        swapped_face[valid_mask] = warped_acc[valid_mask] / weight_acc[valid_mask, None]
+
+        blend_mask = np.clip(hull_mask, 0.0, 1.0)
+        blend_mask = cv2.GaussianBlur(blend_mask, (0, 0), sigmaX=2.6, sigmaY=2.6)
+        blend_mask = np.clip(blend_mask * 0.92, 0.0, 1.0)
+        blend_3 = blend_mask[:, :, None]
+
+        blended = dst_img * (1.0 - blend_3) + swapped_face * blend_3
+        return np.clip(blended, 0.0, 255.0).astype(np.uint8), True
+
+    def swap_face_in_frame(
+        self,
+        *,
+        frame: np.ndarray,
+        source_template: Dict[str, object],
+        target_face_index: int = 0,
+        profile: str = "realtime",
+        previous_target_box: Optional[List[float]] = None,
+        enable_tracking: bool = False,
+        lock_point: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, object]:
+        self._init_model()
+        face_boxes = self._detect_face_boxes(frame, profile=profile)
+        if not face_boxes:
+            return {
+                "frame": frame,
+                "replaced": False,
+                "face_count": 0,
+                "target_box": None,
+                "target_face_index": 0,
+            }
+
+        ordered_boxes = sorted(face_boxes, key=self._box_area, reverse=True)
+        selected_box, selected_index = self._select_target_face_box(
+            ordered_boxes=ordered_boxes,
+            frame_shape=frame.shape,
+            target_face_index=target_face_index,
+            previous_target_box=previous_target_box,
+            enable_tracking=enable_tracking,
+            lock_point=lock_point,
+        )
+        _, target_ver = self._infer_face(frame, selected_box)
+
+        swapped_frame, replaced = self._swap_face_texture(
+            source_image=np.asarray(source_template["image"]),
+            source_ver=source_template["ver"],
+            target_frame=frame,
+            target_ver=target_ver,
+        )
+        return {
+            "frame": swapped_frame,
+            "replaced": bool(replaced),
+            "face_count": len(ordered_boxes),
+            "target_box": self._normalize_box(selected_box),
+            "target_face_index": int(selected_index),
+        }
+
+    def _aggregate_face_attention(
+        self,
+        face_boxes,
+        param_lst,
+        scenario: str,
+    ) -> Tuple[Dict[str, float], float, Dict[str, bool]]:
+        if not face_boxes or not param_lst:
+            zero_pose = {"yaw": 0.0, "pitch": 0.0, "roll": 0.0}
+            zero_score, zero_flags = _attention_from_pose(0.0, 0.0, 0.0, scenario)
+            return zero_pose, zero_score, zero_flags
+
+        face_metrics: List[Dict[str, object]] = []
+        for face_box, param in zip(face_boxes, param_lst):
+            yaw, pitch, roll = self._pose_from_param(param)
+            score, flags = _attention_from_pose(yaw, pitch, roll, scenario)
+            face_metrics.append(
+                {
+                    "yaw": float(yaw),
+                    "pitch": float(pitch),
+                    "roll": float(roll),
+                    "score": float(score),
+                    "flags": flags,
+                    "weight": 1.0,
+                }
+            )
+
+        total_weight = sum(float(item["weight"]) for item in face_metrics) or 1.0
+        pose = {
+            "yaw": sum(float(item["yaw"]) * float(item["weight"]) for item in face_metrics) / total_weight,
+            "pitch": sum(float(item["pitch"]) * float(item["weight"]) for item in face_metrics) / total_weight,
+            "roll": sum(float(item["roll"]) * float(item["weight"]) for item in face_metrics) / total_weight,
+        }
+        score = sum(float(item["score"]) * float(item["weight"]) for item in face_metrics) / total_weight
+        flags = {
+            "head_down": (sum(float(item["weight"]) for item in face_metrics if bool(item["flags"]["head_down"])) / total_weight) >= 0.5,
+            "side_view": (sum(float(item["weight"]) for item in face_metrics if bool(item["flags"]["side_view"])) / total_weight) >= 0.5,
+            "tilted": (sum(float(item["weight"]) for item in face_metrics if bool(item["flags"]["tilted"])) / total_weight) >= 0.5,
+            "distracted": (sum(float(item["weight"]) for item in face_metrics if bool(item["flags"]["distracted"])) / total_weight) >= 0.5,
+        }
+        return pose, score, flags
+
     def _pose_from_param(self, param) -> Tuple[float, float, float]:
         self._ensure_project_on_path()
         from utils.pose import calc_pose
@@ -501,14 +996,23 @@ class ThreeDDFARunner:
             largest = max(boxes, key=self._box_area)
             boxes = [largest]
 
+        frame_h, frame_w = frame.shape[:2]
+        norm_w = max(1.0, float(frame_w))
+        norm_h = max(1.0, float(frame_h))
         param_lst, _ = self.tddfa(frame, boxes)
         faces = []
-        head_up = 0
+        pose_match_count = 0
         score_sum = 0.0
 
-        for idx, param in enumerate(param_lst):
+        for idx, (face_box, param) in enumerate(zip(boxes, param_lst)):
             yaw, pitch, roll = self._pose_from_param(param)
             score, flags = _attention_from_pose(yaw, pitch, roll, scenario)
+            x1 = _clamp(_safe_float(face_box[0]), 0.0, float(max(0, frame_w - 1)))
+            y1 = _clamp(_safe_float(face_box[1]), 0.0, float(max(0, frame_h - 1)))
+            x2 = _clamp(_safe_float(face_box[2]), 0.0, float(max(0, frame_w - 1)))
+            y2 = _clamp(_safe_float(face_box[3]), 0.0, float(max(0, frame_h - 1)))
+            bw = max(0.0, x2 - x1)
+            bh = max(0.0, y2 - y1)
             faces.append(
                 {
                     "face_index": idx,
@@ -516,6 +1020,10 @@ class ThreeDDFARunner:
                     "pitch": round(pitch, 4),
                     "roll": round(roll, 4),
                     "attention_score": round(score, 4),
+                    "bbox_x": round(x1 / norm_w, 6),
+                    "bbox_y": round(y1 / norm_h, 6),
+                    "bbox_w": round(bw / norm_w, 6),
+                    "bbox_h": round(bh / norm_h, 6),
                     "head_down": bool(flags["head_down"]),
                     "side_view": bool(flags["side_view"]),
                     "tilted": bool(flags["tilted"]),
@@ -523,8 +1031,8 @@ class ThreeDDFARunner:
                 }
             )
             score_sum += score
-            if (not flags["head_down"]) and (not flags["side_view"]):
-                head_up += 1
+            if _pose_matches_scenario(yaw, pitch, roll, scenario):
+                pose_match_count += 1
 
         count = len(faces)
         return {
@@ -532,7 +1040,7 @@ class ThreeDDFARunner:
             "scenario": _scenario_key(scenario),
             "face_count": count,
             "avg_attention": round(score_sum / max(1, count), 4),
-            "classroom_head_up_rate": round((head_up / max(1, count)) * 100.0, 4),
+            "classroom_head_up_rate": round((pose_match_count / max(1, count)) * 100.0, 4),
             "faces": faces,
         }
 
@@ -661,17 +1169,12 @@ class ThreeDDFARunner:
         if not cap.isOpened():
             raise RuntimeError("Failed to open video file.")
 
-        sequence_dir = output_dir / "sequence_obj"
-        sequence_dir.mkdir(parents=True, exist_ok=True)
         preview_dir = output_dir / "sequence_preview"
         preview_dir.mkdir(parents=True, exist_ok=True)
 
-        animation_path = output_dir / "animation.mp4"
         metadata_path = output_dir / "sequence_metadata.json"
-        sequence_zip_path = output_dir / "sequence_obj.zip"
         attention_metadata_path = output_dir / "attention_metadata.json"
 
-        writer = None
         frame_index = 0
         total_frames = 0
         reconstructed_frames = 0
@@ -714,51 +1217,42 @@ class ThreeDDFARunner:
                     break
 
                 total_frames += 1
-                if writer is None:
-                    h, w = frame.shape[:2]
-                    writer = cv2.VideoWriter(
-                        str(animation_path),
-                        cv2.VideoWriter_fourcc(*"mp4v"),
-                        fps,
-                        (w, h),
-                    )
-
                 face_boxes = self._detect_face_boxes(frame, profile="video")
                 source = "detected"
                 detection_score = 0.0
                 rapid_turn = False
 
                 if not face_boxes:
-                    writer.write(frame)
                     raw_pose = _interpolate_pose(smoothed_pose if has_pose else {"yaw": 0.0, "pitch": 0.0, "roll": 0.0}, blend=0.12)
                     source = "interpolated"
                     detection_score = 0.0
                     interpolated_frames += 1
+                    raw_score, raw_flags = _attention_from_pose(
+                        raw_pose["yaw"],
+                        raw_pose["pitch"],
+                        raw_pose["roll"],
+                        scenario_key,
+                    )
                 else:
                     param_lst, ver_lst = self._infer_faces(frame, face_boxes)
-                    dominant_index = max(range(len(face_boxes)), key=lambda idx: self._box_area(face_boxes[idx]))
-                    dominant_param = param_lst[dominant_index]
-                    raw_yaw, raw_pitch, raw_roll = self._pose_from_param(dominant_param)
-                    raw_pose = {"yaw": raw_yaw, "pitch": raw_pitch, "roll": raw_roll}
+                    raw_pose, raw_score, raw_flags = self._aggregate_face_attention(
+                        face_boxes,
+                        param_lst,
+                        scenario_key,
+                    )
                     reconstructed_frames += 1
                     detection_score = sum(float(box[4]) if len(box) > 4 else 0.0 for box in face_boxes) / float(max(1, len(face_boxes)))
                     total_area = sum(self._box_area(box) for box in face_boxes)
-
-                    obj_name = "frame_{:06d}.obj".format(frame_index)
-                    obj_path = sequence_dir / obj_name
-                    self.ser_to_obj(frame, ver_lst, self.tddfa.tri, height=frame.shape[0], wfp=str(obj_path))
 
                     rendered = self.render(frame.copy(), ver_lst, self.tddfa.tri, alpha=0.6, show_flag=False)
                     preview_name = "frame_{:06d}.jpg".format(frame_index)
                     preview_path = preview_dir / preview_name
                     cv2.imwrite(str(preview_path), rendered)
-                    writer.write(rendered)
 
                     sequence_entries.append(
                         {
                             "frame_index": frame_index,
                             "face_count": len(face_boxes),
-                            "obj_file": obj_name,
                             "preview_file": preview_name,
                         }
                     )
@@ -774,13 +1268,6 @@ class ThreeDDFARunner:
                         best_frame = frame.copy()
                         best_ver_lst = [ver.copy() for ver in ver_lst]
                         best_index = frame_index
-
-                raw_score, raw_flags = _attention_from_pose(
-                    raw_pose["yaw"],
-                    raw_pose["pitch"],
-                    raw_pose["roll"],
-                    scenario_key,
-                )
 
                 if not has_pose:
                     smoothed_pose = dict(raw_pose)
@@ -842,8 +1329,6 @@ class ThreeDDFARunner:
                     )
         finally:
             cap.release()
-            if writer is not None:
-                writer.release()
 
         if reconstructed_frames == 0 or best_frame is None or best_ver_lst is None:
             raise RuntimeError("No face detected in video frames.")
@@ -866,39 +1351,14 @@ class ThreeDDFARunner:
         _check_cancel(should_abort)
         _report_progress(
             progress_callback,
-            stage="video_packaging",
+            stage="video_finalize",
             percent=97,
-            message="packaging frame models",
+            message="finalizing video result",
             total_frames=total_frames,
             processed_frames=total_frames,
             detected_frames=reconstructed_frames,
             interpolated_frames=interpolated_frames,
         )
-        total_sequence_entries = len(sequence_entries)
-        report_every = max(1, total_sequence_entries // 24) if total_sequence_entries > 0 else 1
-        with zipfile.ZipFile(
-            sequence_zip_path,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=1,
-        ) as zipf:
-            for idx, entry in enumerate(sequence_entries, start=1):
-                obj_file = str(entry["obj_file"])
-                zipf.write(sequence_dir / obj_file, arcname=obj_file)
-                if idx % report_every == 0 or idx == total_sequence_entries:
-                    _check_cancel(should_abort)
-                    pack_ratio = idx / float(max(1, total_sequence_entries))
-                    pack_percent = min(99, 97 + int(round(pack_ratio * 2.0)))
-                    _report_progress(
-                        progress_callback,
-                        stage="video_packaging",
-                        percent=pack_percent,
-                        message="packaging frame models",
-                        total_frames=total_frames,
-                        processed_frames=total_frames,
-                        detected_frames=reconstructed_frames,
-                        interpolated_frames=interpolated_frames,
-                    )
 
         _report_progress(
             progress_callback,
@@ -915,8 +1375,8 @@ class ThreeDDFARunner:
             "total_frames": total_frames,
             "reconstructed_frames": reconstructed_frames,
             "keyframe_index": best_index,
-            "animation_file": animation_path.name,
-            "sequence_zip_file": sequence_zip_path.name,
+            "animation_file": None,
+            "sequence_zip_file": None,
             "preview_dir": preview_dir.name,
             "entries": sequence_entries,
         }
@@ -953,8 +1413,8 @@ class ThreeDDFARunner:
         return {
             "model_path": str(model_path),
             "preview_path": str(preview_path),
-            "sequence_zip_path": str(sequence_zip_path),
-            "animation_path": str(animation_path),
+            "sequence_zip_path": None,
+            "animation_path": None,
             "metadata_path": str(metadata_path),
             "attention_metadata_path": str(attention_metadata_path),
             "keyframe_index": best_index,
@@ -965,6 +1425,109 @@ class ThreeDDFARunner:
                 rapid_turn_events,
             ),
         }
+
+    def export_video_sequence_zip(
+        self,
+        video_path: str,
+        output_zip_path: Path,
+        should_abort: CancelCheck = None,
+    ) -> None:
+        self._init_model()
+        _check_cancel(should_abort)
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open video file.")
+
+        exported_frames = 0
+        frame_index = 0
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="sequence-export-") as temp_dir:
+                temp_root = Path(temp_dir)
+                with zipfile.ZipFile(
+                    output_zip_path,
+                    mode="w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=1,
+                ) as zipf:
+                    while True:
+                        _check_cancel(should_abort)
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+
+                        face_boxes = self._detect_face_boxes(frame, profile="video")
+                        if face_boxes:
+                            _, ver_lst = self._infer_faces(frame, face_boxes)
+                            obj_name = "frame_{:06d}.obj".format(frame_index)
+                            obj_path = temp_root / obj_name
+                            self.ser_to_obj(frame, ver_lst, self.tddfa.tri, height=frame.shape[0], wfp=str(obj_path))
+                            zipf.write(obj_path, arcname=obj_name)
+                            obj_path.unlink(missing_ok=True)
+                            exported_frames += 1
+
+                        frame_index += 1
+        finally:
+            cap.release()
+
+        if exported_frames == 0:
+            raise RuntimeError("No face detected in video frames.")
+
+    def export_video_animation(
+        self,
+        video_path: str,
+        output_video_path: Path,
+        should_abort: CancelCheck = None,
+    ) -> None:
+        self._init_model()
+        _check_cancel(should_abort)
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open video file.")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps is None or fps <= 0:
+            fps = 25.0
+
+        writer = None
+        frame_count = 0
+
+        try:
+            while True:
+                _check_cancel(should_abort)
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                frame_count += 1
+                if writer is None:
+                    h, w = frame.shape[:2]
+                    writer = cv2.VideoWriter(
+                        str(output_video_path),
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        fps,
+                        (w, h),
+                    )
+                    if not writer.isOpened():
+                        raise RuntimeError("Failed to create animation file.")
+
+                face_boxes = self._detect_face_boxes(frame, profile="video")
+                if not face_boxes:
+                    writer.write(frame)
+                    continue
+
+                _, ver_lst = self._infer_faces(frame, face_boxes)
+                rendered = self.render(frame.copy(), ver_lst, self.tddfa.tri, alpha=0.6, show_flag=False)
+                writer.write(rendered)
+        finally:
+            cap.release()
+            if writer is not None:
+                writer.release()
+
+        if frame_count == 0:
+            raise RuntimeError("Video contains no frames.")
 
 _runner_local = threading.local()
 
@@ -988,6 +1551,88 @@ def analyze_attention_frame(
     if frame is None:
         raise RuntimeError("Failed to decode image bytes")
     return _get_runner()._analyze_faces(frame, scenario=scenario, mode=mode)
+
+
+def analyze_attention_frame_ndarray(
+    frame: np.ndarray,
+    *,
+    scenario: str = "classroom",
+    mode: str = "single",
+) -> Dict[str, object]:
+    if frame is None or not hasattr(frame, "shape"):
+        raise RuntimeError("Invalid frame input")
+    return _get_runner()._analyze_faces(frame, scenario=scenario, mode=mode)
+
+
+def extract_face_template(
+    *,
+    media_path: str,
+    media_type: str,
+    source_face_index: int = 0,
+    keyframe_index: Optional[int] = None,
+) -> Dict[str, object]:
+    return _get_runner().extract_face_template(
+        media_path=media_path,
+        media_type=media_type,
+        source_face_index=source_face_index,
+        keyframe_index=keyframe_index,
+    )
+
+
+def swap_face_in_image_bytes(
+    *,
+    image_bytes: bytes,
+    source_template: Dict[str, object],
+    target_face_index: int = 0,
+    profile: str = "realtime",
+    previous_target_box: Optional[List[float]] = None,
+    enable_tracking: bool = False,
+    lock_point: Optional[Tuple[float, float]] = None,
+) -> Dict[str, object]:
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError("Failed to decode image bytes")
+    return _get_runner().swap_face_in_frame(
+        frame=frame,
+        source_template=source_template,
+        target_face_index=target_face_index,
+        profile=profile,
+        previous_target_box=previous_target_box,
+        enable_tracking=enable_tracking,
+        lock_point=lock_point,
+    )
+
+
+def pose_matches_scenario(yaw: float, pitch: float, roll: float, scenario: str) -> bool:
+    return _pose_matches_scenario(yaw, pitch, roll, scenario)
+
+
+def score_attention_from_pose(
+    yaw: float,
+    pitch: float,
+    roll: float,
+    scenario: str,
+) -> Tuple[float, Dict[str, bool]]:
+    return _attention_from_pose(yaw, pitch, roll, scenario)
+
+
+def build_attention_summary_from_entries(
+    entries: List[Dict[str, object]],
+    fps: float,
+    detected_frames: int,
+    interpolated_frames: int,
+    scenario: str,
+    rapid_turn_events: int,
+) -> Dict[str, object]:
+    return _build_attention_summary(
+        entries,
+        fps=fps,
+        detected_frames=detected_frames,
+        interpolated_frames=interpolated_frames,
+        scenario=scenario,
+        rapid_turn_events=rapid_turn_events,
+    )
 
 
 def run_reconstruction(
@@ -1019,3 +1664,27 @@ def run_reconstruction(
             attention_scenario=attention_scenario,
         )
     raise RuntimeError("Unknown media type: {}".format(media_type))
+
+
+def export_video_sequence_zip(
+    media_path: str,
+    output_zip_path: Path,
+    should_abort: CancelCheck = None,
+) -> None:
+    _get_runner().export_video_sequence_zip(
+        media_path,
+        output_zip_path,
+        should_abort=should_abort,
+    )
+
+
+def export_video_animation(
+    media_path: str,
+    output_video_path: Path,
+    should_abort: CancelCheck = None,
+) -> None:
+    _get_runner().export_video_animation(
+        media_path,
+        output_video_path,
+        should_abort=should_abort,
+    )

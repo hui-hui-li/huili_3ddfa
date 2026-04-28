@@ -4,7 +4,10 @@ import asyncio
 import io
 import json
 import os
+import shutil
+import tempfile
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from queue import Empty
 from typing import List, Optional
 from uuid import uuid4
@@ -13,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, get_current_user_for_download
@@ -43,6 +47,12 @@ from app.services.job_queue import (
     subscribe_job_events,
     unsubscribe_job_events,
 )
+from app.services.reconstruction import (
+    build_attention_summary_from_entries,
+    export_video_animation,
+    export_video_sequence_zip,
+    score_attention_from_pose,
+)
 from app.services.storage import delete_job_output_dir
 
 
@@ -53,6 +63,31 @@ def _job_url(job_id: str, endpoint: str, has_file: bool) -> Optional[str]:
     if not has_file:
         return None
     return "/api/reconstructions/{}/{}".format(job_id, endpoint)
+
+
+def _path_exists(path: Optional[str]) -> bool:
+    return bool(path) and os.path.exists(str(path))
+
+
+def _can_generate_video_download(job: ReconstructionJob, media_type: str) -> bool:
+    media = getattr(job, "media", None)
+    stored_path = getattr(media, "stored_path", None)
+    return media_type == "video" and job.status == "completed" and _path_exists(stored_path)
+
+
+def _cleanup_temp_dir(temp_dir: str) -> None:
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _require_original_video_path(job: ReconstructionJob) -> str:
+    media = getattr(job, "media", None)
+    if getattr(media, "media_type", None) != "video" or job.status != "completed":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video output not found")
+
+    stored_path = str(getattr(media, "stored_path", "") or "")
+    if not stored_path or not os.path.exists(stored_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Original video not found")
+    return stored_path
 
 
 def _build_job_response(job: ReconstructionJob) -> ReconstructionResponse:
@@ -70,8 +105,16 @@ def _build_job_response(job: ReconstructionJob) -> ReconstructionResponse:
         attention_scenario=str(job.attention_scenario or "classroom"),
         output_model_path=_job_url(job.id, "download", bool(job.output_model_path)),
         output_preview_path=_job_url(job.id, "preview", bool(job.output_preview_path)),
-        output_sequence_zip_path=_job_url(job.id, "sequence", bool(job.output_sequence_zip_path)),
-        output_animation_path=_job_url(job.id, "animation", bool(job.output_animation_path)),
+        output_sequence_zip_path=_job_url(
+            job.id,
+            "sequence",
+            _path_exists(job.output_sequence_zip_path) or _can_generate_video_download(job, media_type),
+        ),
+        output_animation_path=_job_url(
+            job.id,
+            "animation",
+            _path_exists(job.output_animation_path) or _can_generate_video_download(job, media_type),
+        ),
         output_metadata_path=_job_url(job.id, "metadata", bool(job.output_metadata_path)),
         output_attention_metadata_path=_job_url(job.id, "attention-metadata", bool(job.output_attention_metadata_path)),
         progress_percent=int(job.progress_percent or 0),
@@ -555,7 +598,8 @@ def _load_attention_metadata(job: ReconstructionJob) -> dict:
     if not job.output_attention_metadata_path or not os.path.exists(job.output_attention_metadata_path):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attention metadata output not found")
     with open(job.output_attention_metadata_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        payload = json.load(f)
+    return _normalize_attention_metadata(payload, str(job.attention_scenario or "classroom"))
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -585,6 +629,61 @@ def _moving_avg(entries: List[dict], index: int, window: int = 9) -> float:
     if count <= 0:
         return 0.0
     return total / float(count)
+
+
+def _normalize_attention_metadata(payload: dict, scenario: str) -> dict:
+    scenario_key = str(payload.get("scenario") or scenario or "classroom").strip().lower() or "classroom"
+    fps = _safe_float(payload.get("fps", 25.0), 25.0)
+    raw_entries = payload.get("entries", []) or []
+
+    normalized_entries: List[dict] = []
+    for item in raw_entries:
+        yaw = _safe_float(item.get("yaw", 0.0))
+        pitch = _safe_float(item.get("pitch", 0.0))
+        roll = _safe_float(item.get("roll", 0.0))
+        score, flags = score_attention_from_pose(yaw, pitch, roll, scenario_key)
+        normalized_entries.append(
+            {
+                "frame_index": int(item.get("frame_index", 0)),
+                "yaw": round(yaw, 4),
+                "pitch": round(pitch, 4),
+                "roll": round(roll, 4),
+                "attention_score": round(float(score), 4),
+                "source": str(item.get("source") or "unknown"),
+                "detection_score": round(_safe_float(item.get("detection_score", 0.0)), 4),
+                "head_down": bool(flags["head_down"]),
+                "side_view": bool(flags["side_view"]),
+                "tilted": bool(flags["tilted"]),
+                "distracted": bool(flags["distracted"]),
+                "rapid_turn": _safe_bool(item.get("rapid_turn")),
+            }
+        )
+
+    summary_raw = payload.get("summary") or {}
+    detected_frames = int(summary_raw.get("detected_frames", 0))
+    interpolated_frames = int(summary_raw.get("interpolated_frames", 0))
+    if detected_frames <= 0 and normalized_entries:
+        detected_frames = sum(1 for item in normalized_entries if item.get("source") == "detected")
+    if interpolated_frames <= 0 and normalized_entries:
+        interpolated_frames = sum(1 for item in normalized_entries if item.get("source") != "detected")
+    rapid_turn_events = sum(1 for item in normalized_entries if item.get("rapid_turn"))
+
+    normalized_summary = build_attention_summary_from_entries(
+        normalized_entries,
+        fps=fps,
+        detected_frames=detected_frames,
+        interpolated_frames=interpolated_frames,
+        scenario=scenario_key,
+        rapid_turn_events=rapid_turn_events,
+    )
+
+    return {
+        **payload,
+        "scenario": scenario_key,
+        "fps": round(float(fps), 4),
+        "summary": normalized_summary,
+        "entries": normalized_entries,
+    }
 
 
 @router.get("/{job_id}/download")
@@ -628,13 +727,26 @@ def download_sequence_zip(
     current_user: User = Depends(get_current_user_for_download),
 ):
     job = _get_user_job(db, current_user, job_id)
-    if not job.output_sequence_zip_path or not os.path.exists(job.output_sequence_zip_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sequence output not found")
+    if job.output_sequence_zip_path and os.path.exists(job.output_sequence_zip_path):
+        return FileResponse(
+            path=job.output_sequence_zip_path,
+            filename="{}_sequence_obj.zip".format(job.id),
+            media_type="application/zip",
+        )
 
+    media_path = _require_original_video_path(job)
+    temp_dir = tempfile.mkdtemp(prefix="reconstruction-sequence-")
+    zip_path = Path(temp_dir) / "{}_sequence_obj.zip".format(job.id)
+    try:
+        export_video_sequence_zip(media_path, zip_path)
+    except Exception:
+        _cleanup_temp_dir(temp_dir)
+        raise
     return FileResponse(
-        path=job.output_sequence_zip_path,
+        path=str(zip_path),
         filename="{}_sequence_obj.zip".format(job.id),
         media_type="application/zip",
+        background=BackgroundTask(_cleanup_temp_dir, temp_dir),
     )
 
 
@@ -645,13 +757,26 @@ def download_animation(
     current_user: User = Depends(get_current_user_for_download),
 ):
     job = _get_user_job(db, current_user, job_id)
-    if not job.output_animation_path or not os.path.exists(job.output_animation_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Animation output not found")
+    if job.output_animation_path and os.path.exists(job.output_animation_path):
+        return FileResponse(
+            path=job.output_animation_path,
+            filename="{}_animation.mp4".format(job.id),
+            media_type="video/mp4",
+        )
 
+    media_path = _require_original_video_path(job)
+    temp_dir = tempfile.mkdtemp(prefix="reconstruction-animation-")
+    animation_path = Path(temp_dir) / "{}_animation.mp4".format(job.id)
+    try:
+        export_video_animation(media_path, animation_path)
+    except Exception:
+        _cleanup_temp_dir(temp_dir)
+        raise
     return FileResponse(
-        path=job.output_animation_path,
+        path=str(animation_path),
         filename="{}_animation.mp4".format(job.id),
         media_type="video/mp4",
+        background=BackgroundTask(_cleanup_temp_dir, temp_dir),
     )
 
 
@@ -679,13 +804,13 @@ def download_attention_metadata(
     current_user: User = Depends(get_current_user_for_download),
 ):
     job = _get_user_job(db, current_user, job_id)
-    if not job.output_attention_metadata_path or not os.path.exists(job.output_attention_metadata_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attention metadata output not found")
-
-    return FileResponse(
-        path=job.output_attention_metadata_path,
-        filename="{}_attention_metadata.json".format(job.id),
+    attention_meta = _load_attention_metadata(job)
+    return Response(
+        content=json.dumps(attention_meta, ensure_ascii=False, indent=2),
         media_type="application/json",
+        headers={
+            "Content-Disposition": 'attachment; filename="{}_attention_metadata.json"'.format(job.id),
+        },
     )
 
 

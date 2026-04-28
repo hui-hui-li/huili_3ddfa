@@ -253,6 +253,10 @@ class RealtimeAttentionFace(BaseModel):
     pitch: float
     roll: float
     attention_score: float
+    bbox_x: Optional[float] = None
+    bbox_y: Optional[float] = None
+    bbox_w: Optional[float] = None
+    bbox_h: Optional[float] = None
     head_down: bool
     side_view: bool
     tilted: bool
@@ -266,4 +270,26 @@ class RealtimeAttentionResponse(BaseModel):
     face_count: int
     avg_attention: float
     classroom_head_up_rate: float
+    faces: List[RealtimeAttentionFace]
+
+
+class FaceSwapSourceOption(BaseModel):
+    job_id: str
+    task_name: str
+    media_type: Literal["photo", "video"]
+    attention_scenario: Literal["classroom", "exam", "driving"] = "classroom"
+    created_at: datetime
+
+
+class FaceSwapFrameResponse(BaseModel):
+    mode: Literal["single", "multi"]
+    scenario: Literal["classroom", "exam", "driving"]
+    timestamp: datetime
+    source_job_id: str
+    selected_target_face_index: int = 0
+    face_count: int
+    avg_attention: float
+    classroom_head_up_rate: float
+    replaced: bool
+    swapped_image_base64: str
     faces: List[RealtimeAttentionFace]

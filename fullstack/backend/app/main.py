@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.admin import router as admin_router
 from app.api.attention import router as attention_router
 from app.api.auth import router as auth_router
+from app.api.face_swap import router as face_swap_router
 from app.api.media import router as media_router
 from app.api.reconstructions import router as recon_router
 from app.core.config import settings
@@ -44,6 +45,7 @@ app.include_router(admin_router, prefix=settings.api_prefix)
 app.include_router(media_router, prefix=settings.api_prefix)
 app.include_router(recon_router, prefix=settings.api_prefix)
 app.include_router(attention_router, prefix=settings.api_prefix)
+app.include_router(face_swap_router, prefix=settings.api_prefix)
 
 
 @app.get("/healthz")

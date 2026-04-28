@@ -6,6 +6,10 @@ let currentUser = null;
 let currentAttentionJobId = null;
 let framePlaybackTimer = null;
 let lastAttentionCurveData = { points: [] };
+let swapSourceOptions = [];
+let cameraStream = null;
+let cameraLoopTimer = null;
+let cameraRequestInFlight = false;
 const selectedMediaIds = new Set();
 const selectedJobIds = new Set();
 const jobEventStreams = new Map();
@@ -17,6 +21,14 @@ const framePreviewState = {
   total: 0,
   entries: [],
   currentIndex: 0,
+};
+const cameraLoopState = {
+  sessionId: `cam-${Math.random().toString(36).slice(2, 10)}`,
+  frameSeq: 0,
+  lockPoint: null,
+  lockedFaceIndex: null,
+  lockPending: false,
+  lockActive: false,
 };
 
 const authPanel = document.getElementById('auth-panel');
@@ -68,6 +80,10 @@ const imagePreviewModal = document.getElementById('image-preview-modal');
 const imagePreviewTitle = document.getElementById('image-preview-title');
 const imagePreviewMeta = document.getElementById('image-preview-meta');
 const imagePreviewImage = document.getElementById('image-preview-image');
+const photoAnalysisPreview = document.getElementById('photo-analysis-preview');
+const photoAnalysisImage = document.getElementById('photo-analysis-image');
+const photoAnalysisMeta = document.getElementById('photo-analysis-meta');
+const photoAnalysisPreviewOpen = document.getElementById('photo-analysis-preview-open');
 
 const realtimeAttentionSummary = document.getElementById('realtime-attention-summary');
 const realtimeAttentionBody = document.getElementById('realtime-attention-body');
@@ -80,9 +96,30 @@ const videoUploadScenarioSelect = document.getElementById('video-upload-scenario
 const jobsStatusFilter = document.getElementById('jobs-status-filter');
 const jobsScenarioFilter = document.getElementById('jobs-scenario-filter');
 const attentionCurveCanvas = document.getElementById('attention-curve-canvas');
+const cameraScenarioSelect = document.getElementById('camera-scenario');
+const cameraModeSelect = document.getElementById('camera-mode');
+const cameraRunModeSelect = document.getElementById('camera-run-mode');
+const cameraSourceJobSelect = document.getElementById('camera-source-job');
+const cameraSourceFaceIndexInput = document.getElementById('camera-source-face-index');
+const cameraTargetFaceIndexInput = document.getElementById('camera-target-face-index');
+const cameraIntervalMsInput = document.getElementById('camera-interval-ms');
+const cameraStartBtn = document.getElementById('camera-start-btn');
+const cameraStopBtn = document.getElementById('camera-stop-btn');
+const cameraClearLockBtn = document.getElementById('camera-clear-lock-btn');
+const cameraRuntimeStatus = document.getElementById('camera-runtime-status');
+const cameraLockStatus = document.getElementById('camera-lock-status');
+const cameraVideoEl = document.getElementById('camera-video');
+const cameraProcessedImage = document.getElementById('camera-processed-image');
+const cameraOverlayCanvas = document.getElementById('camera-overlay-canvas');
+const cameraAnalysisSummary = document.getElementById('camera-analysis-summary');
+const cameraAttentionBody = document.getElementById('camera-attention-body');
 const RELOAD_VIEW_KEY = 'app_reload_view';
 const RELOAD_MSG_KEY = 'app_reload_msg';
 const RELOAD_TYPE_KEY = 'app_reload_type';
+let currentPhotoAnalysisPreviewUrl = '';
+let currentPhotoAnalysisPreviewTitle = '分析图片';
+let currentPhotoAnalysisPreviewMeta = '';
+let currentPhotoAnalysisOwnsUrl = false;
 const STATUS_LABELS = {
   queued: '排队中',
   running: '进行中',
@@ -107,8 +144,10 @@ const WARNING_LABELS = {
   'no-face-detected': '未检测到人脸',
   'frequent-low-attention': '频繁低专注',
   'head-down-too-long': '低头时间过长',
+  'head-up-too-long': '抬头时间过长',
   'long-side-view': '长时间侧视',
   'frequent-head-turn': '频繁转头',
+  'unsafe-downward-gaze': '低头时间过长',
   'driving-distraction-risk': '存在驾驶分心风险',
 };
 const STAGE_LABELS = {
@@ -147,6 +186,14 @@ const MESSAGE_LABELS = {
   'cancelled by user before start': '任务开始前已取消',
   'cancelled by user': '用户已取消任务',
 };
+const cameraCaptureCanvas = document.createElement('canvas');
+cameraCaptureCanvas.width = 640;
+cameraCaptureCanvas.height = 360;
+const cameraOverlayState = {
+  faces: [],
+  sourceWidth: 0,
+  sourceHeight: 0,
+};
 
 function setMsg(el, text, type = '') {
   el.textContent = text || '';
@@ -171,6 +218,8 @@ async function api(path, options = {}) {
       currentUser = null;
       closeAllJobEventStreams();
       closeImagePreviewModal();
+      stopCameraStream();
+      resetCameraAnalysisPanel();
       if (pollTimer) {
         clearInterval(pollTimer);
         pollTimer = null;
@@ -204,6 +253,7 @@ function switchAuthTab(mode) {
 }
 
 function switchAppView(viewId) {
+  const previousViewId = getCurrentViewId();
   const hasTarget = appViews.some((view) => view.id === viewId);
   const targetViewId = hasTarget ? viewId : 'view-media';
   appViews.forEach((view) => {
@@ -212,6 +262,9 @@ function switchAppView(viewId) {
   appNavButtons.forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.view === targetViewId);
   });
+  if (previousViewId === 'view-camera-swap' && targetViewId !== 'view-camera-swap') {
+    stopCameraStream();
+  }
 }
 
 function getCurrentViewId() {
@@ -387,6 +440,18 @@ function getUploadScenario(selectEl) {
   const value = (selectEl && selectEl.value) || 'classroom';
   if (value === 'exam' || value === 'driving' || value === 'classroom') return value;
   return 'classroom';
+}
+
+function parseFaceIndex(inputEl) {
+  const raw = Number(inputEl ? inputEl.value : 0);
+  if (!Number.isFinite(raw)) return 0;
+  return Math.max(0, Math.min(12, Math.floor(raw)));
+}
+
+function parseIntervalMs(inputEl) {
+  const raw = Number(inputEl ? inputEl.value : 420);
+  if (!Number.isFinite(raw)) return 420;
+  return Math.max(120, Math.min(3000, Math.floor(raw)));
 }
 
 function updateBatchDeleteButton() {
@@ -665,6 +730,58 @@ function openImagePreview({
   imagePreviewModal.classList.remove('hidden');
 }
 
+function resetPhotoAnalysisPreview() {
+  if (currentPhotoAnalysisOwnsUrl && currentPhotoAnalysisPreviewUrl) {
+    URL.revokeObjectURL(currentPhotoAnalysisPreviewUrl);
+  }
+  currentPhotoAnalysisPreviewUrl = '';
+  currentPhotoAnalysisPreviewTitle = '分析图片';
+  currentPhotoAnalysisPreviewMeta = '';
+  currentPhotoAnalysisOwnsUrl = false;
+  if (photoAnalysisImage) photoAnalysisImage.src = '';
+  if (photoAnalysisMeta) photoAnalysisMeta.textContent = '';
+  if (photoAnalysisPreview) photoAnalysisPreview.classList.add('hidden');
+}
+
+function renderPhotoAnalysisPreview({
+  imageUrl = '',
+  title = '分析图片',
+  meta = '',
+  ownsUrl = false,
+}) {
+  resetPhotoAnalysisPreview();
+  if (!imageUrl || !photoAnalysisPreview || !photoAnalysisImage) return;
+  currentPhotoAnalysisPreviewUrl = imageUrl;
+  currentPhotoAnalysisPreviewTitle = title;
+  currentPhotoAnalysisPreviewMeta = meta;
+  currentPhotoAnalysisOwnsUrl = Boolean(ownsUrl);
+  photoAnalysisImage.src = imageUrl;
+  if (photoAnalysisMeta) photoAnalysisMeta.textContent = meta;
+  photoAnalysisPreview.classList.remove('hidden');
+}
+
+if (photoAnalysisPreviewOpen) {
+  photoAnalysisPreviewOpen.addEventListener('click', () => {
+    if (!currentPhotoAnalysisPreviewUrl) return;
+    openImagePreview({
+      title: currentPhotoAnalysisPreviewTitle,
+      imageUrl: currentPhotoAnalysisPreviewUrl,
+      meta: currentPhotoAnalysisPreviewMeta,
+    });
+  });
+}
+
+if (photoAnalysisImage) {
+  photoAnalysisImage.addEventListener('click', () => {
+    if (!currentPhotoAnalysisPreviewUrl) return;
+    openImagePreview({
+      title: currentPhotoAnalysisPreviewTitle,
+      imageUrl: currentPhotoAnalysisPreviewUrl,
+      meta: currentPhotoAnalysisPreviewMeta,
+    });
+  });
+}
+
 async function stepToNextFrame() {
   if (!framePreviewState.entries.length) return false;
 
@@ -916,16 +1033,22 @@ async function loadAttentionForJob(jobId, switchToAttentionView = false) {
       : String(jobId);
 
     const warnings = (summary.warnings || []).length ? summary.warnings.map(displayWarning).join('、') : '无';
-    attentionSummaryText.textContent = [
+    const scenarioKey = String(summary.scenario || '').toLowerCase();
+    const summaryParts = [
       `任务: ${selectedJobName}`,
       `场景: ${displayScenario(summary.scenario)}`,
       `平均专注度: ${Number(summary.avg_attention || 0).toFixed(2)}`,
       `低专注比例: ${(Number(summary.low_attention_ratio || 0) * 100).toFixed(2)}%`,
-      `抬头率: ${Number(summary.classroom_head_up_rate || 0).toFixed(2)}%`,
-      `考试专注分: ${Number(summary.exam_focus_score || 0).toFixed(2)}`,
-      `驾驶风险分: ${Number(summary.driving_risk_score || 0).toFixed(2)}`,
-      `预警: ${warnings}`,
-    ].join(' | ');
+      `姿态符合率: ${Number(summary.classroom_head_up_rate || 0).toFixed(2)}%`,
+    ];
+    if (String(summary.scenario || '').toLowerCase() === 'exam') {
+      summaryParts.push(`考试专注分: ${Number(summary.exam_focus_score || 0).toFixed(2)}`);
+    }
+    if (String(summary.scenario || '').toLowerCase() === 'driving') {
+      summaryParts.push(`驾驶风险分: ${Number(summary.driving_risk_score || 0).toFixed(2)}`);
+    }
+    summaryParts.push(`预警: ${warnings}`);
+    attentionSummaryText.textContent = summaryParts.join(' | ');
 
     attentionTimelineBody.innerHTML = '';
     const entries = timeline.entries || [];
@@ -936,8 +1059,8 @@ async function loadAttentionForJob(jobId, switchToAttentionView = false) {
         const tr = document.createElement('tr');
         const frameImageUrl = getProtectedFrameImageUrl(jobId, entry.frame_index);
         const tags = [];
-        if (entry.head_down) tags.push('低头');
-        if (entry.side_view) tags.push('偏头');
+        if (entry.head_down) tags.push(scenarioKey === 'exam' ? '作答姿态' : '低头');
+        if (entry.side_view && (scenarioKey !== 'exam' || entry.distracted)) tags.push('偏头');
         if (entry.tilted) tags.push('倾斜');
         if (entry.rapid_turn) tags.push('转头');
         if (entry.distracted) tags.push('分心');
@@ -1009,11 +1132,16 @@ async function loadPhotoAnalysisFromJob(job, switchToPhotoView = true) {
       classroom_head_up_rate: summary.classroom_head_up_rate ?? (
         faces.filter((face) => !face.head_down && !face.side_view).length / Math.max(1, faces.length)
       ) * 100,
+      previewImageUrl: job.output_preview_path
+        ? `${API_PREFIX}/reconstructions/${job.id}/preview?access_token=${encodeURIComponent(token)}`
+        : '',
+      previewTitle: '照片分析图片',
+      previewMeta: `任务：${job.task_name} | 场景：${displayScenario(summary.scenario || meta.scenario || job.attention_scenario || 'classroom')}`,
       faces,
     };
 
     renderRealtimeAttention(payload);
-    realtimeAttentionSummary.textContent = `任务：${job.task_name} | 场景：${displayScenario(payload.scenario)} | 模式：${displayMode(payload.mode)} | 人脸数：${payload.face_count} | 平均专注度：${Number(payload.avg_attention || 0).toFixed(2)} | 抬头率：${Number(payload.classroom_head_up_rate || 0).toFixed(2)}%`;
+    realtimeAttentionSummary.textContent = `任务：${job.task_name} | 场景：${displayScenario(payload.scenario)} | 模式：${displayMode(payload.mode)} | 人脸数：${payload.face_count} | 平均专注度：${Number(payload.avg_attention || 0).toFixed(2)} | 姿态符合率：${Number(payload.classroom_head_up_rate || 0).toFixed(2)}%`;
     document.getElementById('attention-scenario').value = payload.scenario;
     document.getElementById('attention-mode').value = payload.mode === 'multi' ? 'multi' : 'single';
     document.getElementById('attention-session-id').value = '';
@@ -1049,7 +1177,13 @@ function renderRealtimeAttention(data) {
   const faceCount = Number(data.face_count || 0);
   const avgAttention = Number(data.avg_attention || 0).toFixed(2);
   const headUpRate = Number(data.classroom_head_up_rate || 0).toFixed(2);
-  realtimeAttentionSummary.textContent = `模式：${displayMode(data.mode)} | 场景：${displayScenario(data.scenario)} | 人脸数：${faceCount} | 平均专注度：${avgAttention} | 抬头率：${headUpRate}%`;
+  renderPhotoAnalysisPreview({
+    imageUrl: data.previewImageUrl || '',
+    title: data.previewTitle || '分析图片',
+    meta: data.previewMeta || '',
+    ownsUrl: Boolean(data.previewOwnsUrl),
+  });
+  realtimeAttentionSummary.textContent = `模式：${displayMode(data.mode)} | 场景：${displayScenario(data.scenario)} | 人脸数：${faceCount} | 平均专注度：${avgAttention} | 姿态符合率：${headUpRate}%`;
 
   realtimeAttentionBody.innerHTML = '';
   const faces = data.faces || [];
@@ -1060,8 +1194,8 @@ function renderRealtimeAttention(data) {
 
   faces.forEach((face) => {
     const tags = [];
-    if (face.head_down) tags.push('低头');
-    if (face.side_view) tags.push('侧视');
+    if (face.head_down) tags.push(String(data.scenario || '').toLowerCase() === 'exam' ? '作答姿态' : '低头');
+    if (face.side_view && (String(data.scenario || '').toLowerCase() !== 'exam' || face.distracted)) tags.push('侧视');
     if (face.tilted) tags.push('倾斜');
     if (face.distracted) tags.push('分心');
 
@@ -1076,6 +1210,473 @@ function renderRealtimeAttention(data) {
     `;
     realtimeAttentionBody.appendChild(tr);
   });
+}
+
+function renderCameraAttention(data) {
+  if (!cameraAnalysisSummary || !cameraAttentionBody) return;
+
+  const faceCount = Number(data.face_count || 0);
+  const avgAttention = Number(data.avg_attention || 0).toFixed(2);
+  const poseRate = Number(data.classroom_head_up_rate || 0).toFixed(2);
+  const replacedText = data.replaced == null ? '' : ` | 换脸: ${data.replaced ? '成功' : '未替换'}`;
+  cameraAnalysisSummary.textContent = `模式：${displayMode(data.mode)} | 场景：${displayScenario(data.scenario)} | 人脸数：${faceCount} | 平均专注度：${avgAttention} | 姿态符合率：${poseRate}%${replacedText}`;
+  if (Number.isFinite(Number(data.selected_target_face_index))) {
+    cameraLoopState.lockedFaceIndex = Number(data.selected_target_face_index);
+  } else if (!cameraLoopState.lockActive) {
+    cameraLoopState.lockedFaceIndex = null;
+  }
+  cameraOverlayState.faces = Array.isArray(data.faces) ? data.faces : [];
+  cameraOverlayState.sourceWidth = cameraVideoEl?.videoWidth || cameraCaptureCanvas.width || 0;
+  cameraOverlayState.sourceHeight = cameraVideoEl?.videoHeight || cameraCaptureCanvas.height || 0;
+  drawCameraOverlay();
+
+  cameraAttentionBody.innerHTML = '';
+  const faces = data.faces || [];
+  if (!faces.length) {
+    cameraAttentionBody.innerHTML = '<tr><td colspan="6">未检测到人脸</td></tr>';
+    return;
+  }
+
+  faces.forEach((face) => {
+    const tags = [];
+    const scenarioKey = String(data.scenario || '').toLowerCase();
+    if (face.head_down) tags.push(scenarioKey === 'exam' ? '作答姿态' : '低头');
+    if (face.side_view && (scenarioKey !== 'exam' || face.distracted)) tags.push('侧视');
+    if (face.tilted) tags.push('倾斜');
+    if (face.distracted) tags.push('分心');
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${Number(face.face_index ?? 0) + 1}</td>
+      <td>${Number(face.yaw || 0).toFixed(2)}</td>
+      <td>${Number(face.pitch || 0).toFixed(2)}</td>
+      <td>${Number(face.roll || 0).toFixed(2)}</td>
+      <td>${Number(face.attention_score || 0).toFixed(2)}</td>
+      <td>${tags.join(' / ') || '正常'}</td>
+    `;
+    cameraAttentionBody.appendChild(tr);
+  });
+}
+
+function setCameraRuntimeText(text, type = '') {
+  if (!cameraRuntimeStatus) return;
+  cameraRuntimeStatus.textContent = text || '';
+  cameraRuntimeStatus.classList.remove('error', 'ok');
+  if (type) cameraRuntimeStatus.classList.add(type);
+}
+
+function setCameraLockText(text, type = '') {
+  if (!cameraLockStatus) return;
+  cameraLockStatus.textContent = text || '';
+  cameraLockStatus.classList.remove('error', 'ok');
+  if (type) cameraLockStatus.classList.add(type);
+}
+
+function clearCameraLock() {
+  cameraLoopState.lockPoint = null;
+  cameraLoopState.lockedFaceIndex = null;
+  cameraLoopState.lockPending = false;
+  cameraLoopState.lockActive = false;
+  cameraLoopState.sessionId = `cam-${Math.random().toString(36).slice(2, 10)}`;
+  setCameraLockText('当前未手动锁定人脸');
+  drawCameraOverlay();
+}
+
+function getContainedDrawRect(displayWidth, displayHeight, sourceWidth, sourceHeight) {
+  const dw = Number(displayWidth || 0);
+  const dh = Number(displayHeight || 0);
+  const sw = Number(sourceWidth || 0);
+  const sh = Number(sourceHeight || 0);
+  if (!(dw > 1 && dh > 1)) return null;
+  if (!(sw > 1 && sh > 1)) {
+    return { offsetX: 0, offsetY: 0, drawW: dw, drawH: dh };
+  }
+  const scale = Math.min(dw / sw, dh / sh);
+  const drawW = sw * scale;
+  const drawH = sh * scale;
+  const offsetX = (dw - drawW) * 0.5;
+  const offsetY = (dh - drawH) * 0.5;
+  return { offsetX, offsetY, drawW, drawH };
+}
+
+function getContainedMediaNormalizedPoint(event, mediaEl, sourceWidth, sourceHeight) {
+  if (!mediaEl) return null;
+  const rect = mediaEl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const px = event.clientX - rect.left;
+  const py = event.clientY - rect.top;
+  if (px < 0 || py < 0 || px > rect.width || py > rect.height) return null;
+
+  const srcW = Number(sourceWidth || 0);
+  const srcH = Number(sourceHeight || 0);
+  if (!(srcW > 1 && srcH > 1)) {
+    return {
+      x: Math.max(0, Math.min(1, px / rect.width)),
+      y: Math.max(0, Math.min(1, py / rect.height)),
+    };
+  }
+
+  const drawRect = getContainedDrawRect(rect.width, rect.height, srcW, srcH);
+  if (!drawRect) return null;
+  const { offsetX, offsetY, drawW, drawH } = drawRect;
+  const localX = px - offsetX;
+  const localY = py - offsetY;
+  if (localX < 0 || localY < 0 || localX > drawW || localY > drawH) {
+    return null;
+  }
+  return {
+    x: Math.max(0, Math.min(1, localX / drawW)),
+    y: Math.max(0, Math.min(1, localY / drawH)),
+  };
+}
+
+function resizeCameraOverlayCanvas() {
+  if (!cameraOverlayCanvas) return;
+  const rect = cameraOverlayCanvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(2, Math.round(rect.width * dpr));
+  const height = Math.max(2, Math.round(rect.height * dpr));
+  if (cameraOverlayCanvas.width !== width || cameraOverlayCanvas.height !== height) {
+    cameraOverlayCanvas.width = width;
+    cameraOverlayCanvas.height = height;
+  }
+}
+
+function drawCameraOverlay() {
+  if (!cameraOverlayCanvas) return;
+  resizeCameraOverlayCanvas();
+  const ctx = cameraOverlayCanvas.getContext('2d');
+  if (!ctx) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const width = cameraOverlayCanvas.width / dpr;
+  const height = cameraOverlayCanvas.height / dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const sourceWidth = cameraOverlayState.sourceWidth || cameraVideoEl?.videoWidth || 0;
+  const sourceHeight = cameraOverlayState.sourceHeight || cameraVideoEl?.videoHeight || 0;
+  const drawRect = getContainedDrawRect(width, height, sourceWidth, sourceHeight);
+  if (!drawRect) return;
+
+  const { offsetX, offsetY, drawW, drawH } = drawRect;
+  const faces = Array.isArray(cameraOverlayState.faces) ? cameraOverlayState.faces : [];
+
+  faces.forEach((face, idx) => {
+    const bx = Number(face.bbox_x);
+    const by = Number(face.bbox_y);
+    const bw = Number(face.bbox_w);
+    const bh = Number(face.bbox_h);
+    if (![bx, by, bw, bh].every((v) => Number.isFinite(v))) return;
+    const x = offsetX + bx * drawW;
+    const y = offsetY + by * drawH;
+    const w = Math.max(2, bw * drawW);
+    const h = Math.max(2, bh * drawH);
+    const faceIndex = Number.isFinite(Number(face.face_index)) ? Number(face.face_index) : idx;
+    const selected = cameraLoopState.lockedFaceIndex === faceIndex;
+
+    ctx.lineWidth = selected ? 2.5 : 1.6;
+    ctx.strokeStyle = selected ? '#ffd84a' : '#1f6feb';
+    ctx.fillStyle = selected ? 'rgba(255, 216, 74, 0.18)' : 'rgba(31, 111, 235, 0.14)';
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = selected ? '#3f3200' : '#0f2c60';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(`#${faceIndex + 1}`, x + 4, Math.max(12, y - 4));
+  });
+
+  if (cameraLoopState.lockActive && cameraLoopState.lockPoint) {
+    const cx = offsetX + cameraLoopState.lockPoint.x * drawW;
+    const cy = offsetY + cameraLoopState.lockPoint.y * drawH;
+    ctx.strokeStyle = '#ff7f27';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, cy);
+    ctx.lineTo(cx + 8, cy);
+    ctx.moveTo(cx, cy - 8);
+    ctx.lineTo(cx, cy + 8);
+    ctx.stroke();
+  }
+}
+
+function chooseFaceFromOverlayPoint(point) {
+  const faces = Array.isArray(cameraOverlayState.faces) ? cameraOverlayState.faces : [];
+  if (!faces.length) return null;
+  const x = Number(point.x);
+  const y = Number(point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+
+  let hit = null;
+  let hitArea = Number.POSITIVE_INFINITY;
+  let nearest = null;
+  let nearestDist = Number.POSITIVE_INFINITY;
+
+  faces.forEach((face, idx) => {
+    const bx = Number(face.bbox_x);
+    const by = Number(face.bbox_y);
+    const bw = Number(face.bbox_w);
+    const bh = Number(face.bbox_h);
+    if (![bx, by, bw, bh].every((v) => Number.isFinite(v))) return;
+    const x2 = bx + bw;
+    const y2 = by + bh;
+    const area = Math.max(1e-6, bw * bh);
+    const cx = bx + bw * 0.5;
+    const cy = by + bh * 0.5;
+    const dist = Math.hypot(cx - x, cy - y);
+
+    if (x >= bx && x <= x2 && y >= by && y <= y2) {
+      if (area < hitArea) {
+        hitArea = area;
+        hit = { face, idx };
+      }
+      return;
+    }
+    if (dist < nearestDist) {
+      nearestDist = dist;
+      nearest = { face, idx };
+    }
+  });
+
+  if (hit) return hit;
+  if (nearest && nearestDist <= 0.28) return nearest;
+  return null;
+}
+
+function lockFaceByClick(event, mediaEl) {
+  if (!cameraStream || !cameraVideoEl) return;
+  const sourceWidth = cameraOverlayState.sourceWidth || cameraVideoEl.videoWidth || cameraCaptureCanvas.width || 0;
+  const sourceHeight = cameraOverlayState.sourceHeight || cameraVideoEl.videoHeight || cameraCaptureCanvas.height || 0;
+  const point = getContainedMediaNormalizedPoint(event, mediaEl, sourceWidth, sourceHeight);
+  if (!point) {
+    setCameraLockText('点击位置不在视频有效区域，请重新点击', 'error');
+    return;
+  }
+  const matched = chooseFaceFromOverlayPoint(point);
+  if (matched) {
+    const bx = Number(matched.face.bbox_x) || 0;
+    const by = Number(matched.face.bbox_y) || 0;
+    const bw = Number(matched.face.bbox_w) || 0;
+    const bh = Number(matched.face.bbox_h) || 0;
+    cameraLoopState.lockPoint = {
+      x: Math.max(0, Math.min(1, bx + bw * 0.5)),
+      y: Math.max(0, Math.min(1, by + bh * 0.5)),
+    };
+    cameraLoopState.lockedFaceIndex = Number(matched.face.face_index ?? matched.idx);
+  } else {
+    cameraLoopState.lockPoint = point;
+    cameraLoopState.lockedFaceIndex = null;
+  }
+  cameraLoopState.lockActive = true;
+  cameraLoopState.lockPending = true;
+  const xPct = (cameraLoopState.lockPoint.x * 100).toFixed(1);
+  const yPct = (cameraLoopState.lockPoint.y * 100).toFixed(1);
+  const label = cameraLoopState.lockedFaceIndex == null
+    ? `已设置手动锁定点 (${xPct}%, ${yPct}%)，正在匹配人脸`
+    : `已框选目标人脸 #${cameraLoopState.lockedFaceIndex + 1}，锁定点 (${xPct}%, ${yPct}%)`;
+  setCameraLockText(label, 'ok');
+  drawCameraOverlay();
+}
+
+function resetCameraAnalysisPanel() {
+  if (cameraAnalysisSummary) cameraAnalysisSummary.textContent = '尚未开始实时分析';
+  if (cameraAttentionBody) cameraAttentionBody.innerHTML = '<tr><td colspan="6">尚未开始</td></tr>';
+  if (cameraProcessedImage) cameraProcessedImage.src = '';
+  cameraOverlayState.faces = [];
+  cameraOverlayState.sourceWidth = 0;
+  cameraOverlayState.sourceHeight = 0;
+  drawCameraOverlay();
+}
+
+function stopCameraLoop() {
+  if (cameraLoopTimer) {
+    clearTimeout(cameraLoopTimer);
+    cameraLoopTimer = null;
+  }
+  cameraRequestInFlight = false;
+}
+
+function stopCameraStream() {
+  stopCameraLoop();
+  if (cameraStream) {
+    cameraStream.getTracks().forEach((track) => track.stop());
+    cameraStream = null;
+  }
+  if (cameraVideoEl) {
+    cameraVideoEl.srcObject = null;
+  }
+  if (cameraStartBtn) cameraStartBtn.disabled = false;
+  if (cameraStopBtn) cameraStopBtn.disabled = true;
+  setCameraRuntimeText('摄像头未启动');
+  clearCameraLock();
+}
+
+function scheduleCameraLoop() {
+  const intervalMs = parseIntervalMs(cameraIntervalMsInput);
+  cameraLoopTimer = setTimeout(() => {
+    runCameraLoopTick().catch((err) => {
+      setCameraRuntimeText(`实时处理失败: ${err.message}`, 'error');
+      scheduleCameraLoop();
+    });
+  }, intervalMs);
+}
+
+function captureCameraFrameBlob() {
+  return new Promise((resolve, reject) => {
+    if (!cameraVideoEl || cameraVideoEl.readyState < 2) {
+      reject(new Error('摄像头帧尚未就绪'));
+      return;
+    }
+    const width = cameraVideoEl.videoWidth || 640;
+    const height = cameraVideoEl.videoHeight || 360;
+    cameraCaptureCanvas.width = width;
+    cameraCaptureCanvas.height = height;
+    const ctx = cameraCaptureCanvas.getContext('2d');
+    if (!ctx) {
+      reject(new Error('无法获取画布上下文'));
+      return;
+    }
+    ctx.drawImage(cameraVideoEl, 0, 0, width, height);
+    cameraCaptureCanvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error('抓帧失败'));
+          return;
+        }
+        resolve(blob);
+      },
+      'image/jpeg',
+      0.86,
+    );
+  });
+}
+
+async function runCameraLoopTick() {
+  if (!cameraStream || cameraRequestInFlight) {
+    return;
+  }
+  cameraRequestInFlight = true;
+  try {
+    const scenario = (cameraScenarioSelect && cameraScenarioSelect.value) || 'classroom';
+    const mode = (cameraModeSelect && cameraModeSelect.value) || 'single';
+    const runMode = (cameraRunModeSelect && cameraRunModeSelect.value) || 'analyze';
+    const sourceJobId = cameraSourceJobSelect ? cameraSourceJobSelect.value.trim() : '';
+    const sourceFaceIndex = parseFaceIndex(cameraSourceFaceIndexInput);
+    const targetFaceIndex = parseFaceIndex(cameraTargetFaceIndexInput);
+
+    if (runMode === 'swap' && !sourceJobId) {
+      setCameraRuntimeText('换脸模式需要先选择源任务', 'error');
+      return;
+    }
+
+    const blob = await captureCameraFrameBlob();
+    const fd = new FormData();
+    fd.append('file', blob, `camera_${Date.now()}.jpg`);
+
+    let path = `/attention/frame?scenario=${encodeURIComponent(scenario)}&mode=${encodeURIComponent(mode)}&session_id=${encodeURIComponent(cameraLoopState.sessionId)}`;
+    if (runMode === 'swap') {
+      path = `/face-swap/frame?scenario=${encodeURIComponent(scenario)}&mode=${encodeURIComponent(mode)}&source_job_id=${encodeURIComponent(sourceJobId)}&source_face_index=${sourceFaceIndex}&target_face_index=${targetFaceIndex}&session_id=${encodeURIComponent(cameraLoopState.sessionId)}&track_target_face=true`;
+      const shouldSendLock = Boolean(cameraLoopState.lockPoint) && (cameraLoopState.lockPending || cameraLoopState.lockedFaceIndex == null);
+      if (shouldSendLock) {
+        path += `&lock_x=${encodeURIComponent(cameraLoopState.lockPoint.x)}&lock_y=${encodeURIComponent(cameraLoopState.lockPoint.y)}`;
+      }
+    }
+
+    const result = await api(path, {
+      method: 'POST',
+      body: fd,
+    });
+
+    renderCameraAttention(result);
+    if (runMode === 'swap' && Number.isFinite(Number(result.selected_target_face_index))) {
+      const idx = Number(result.selected_target_face_index);
+      if (cameraLoopState.lockPending) {
+        cameraLoopState.lockPending = false;
+      }
+      const lockSuffix = cameraLoopState.lockPoint ? '（手动锁定中）' : '（自动跟踪）';
+      setCameraLockText(`当前目标人脸: #${idx + 1} ${lockSuffix}`, 'ok');
+    } else if (runMode === 'swap' && Number(result.face_count || 0) <= 0) {
+      cameraLoopState.lockedFaceIndex = null;
+      if (cameraLoopState.lockActive) {
+        cameraLoopState.lockPending = true;
+        setCameraLockText('未检测到人脸，保持手动锁定，等待重新捕获', 'error');
+      }
+    }
+    if (runMode === 'swap' && result.swapped_image_base64) {
+      if (cameraProcessedImage) {
+        cameraProcessedImage.src = `data:image/jpeg;base64,${result.swapped_image_base64}`;
+      }
+    } else if (cameraProcessedImage) {
+      cameraProcessedImage.src = cameraCaptureCanvas.toDataURL('image/jpeg', 0.82);
+    }
+    drawCameraOverlay();
+    cameraLoopState.frameSeq += 1;
+    setCameraRuntimeText(`实时处理中，已完成 ${cameraLoopState.frameSeq} 帧`, 'ok');
+  } finally {
+    cameraRequestInFlight = false;
+    if (cameraStream) scheduleCameraLoop();
+  }
+}
+
+async function startCameraStream() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error('当前浏览器不支持摄像头访问');
+  }
+  if (!cameraVideoEl) {
+    throw new Error('摄像头预览组件不存在');
+  }
+  if (!cameraStream) {
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    });
+    cameraVideoEl.srcObject = cameraStream;
+  }
+
+  try {
+    await cameraVideoEl.play();
+  } catch (_) {}
+
+  cameraLoopState.sessionId = `cam-${Math.random().toString(36).slice(2, 10)}`;
+  cameraLoopState.frameSeq = 0;
+  clearCameraLock();
+  if (cameraStartBtn) cameraStartBtn.disabled = true;
+  if (cameraStopBtn) cameraStopBtn.disabled = false;
+  setCameraRuntimeText('摄像头已启动，准备实时分析...');
+  stopCameraLoop();
+  scheduleCameraLoop();
+}
+
+async function loadFaceSwapOptions() {
+  const sources = await api('/face-swap/sources');
+  swapSourceOptions = Array.isArray(sources) ? sources : [];
+
+  const fillSelect = (selectEl, placeholder, list, mapLabel, preserve = true) => {
+    if (!selectEl) return;
+    const prev = preserve ? selectEl.value : '';
+    selectEl.innerHTML = `<option value="">${placeholder}</option>`;
+    list.forEach((item) => {
+      const option = document.createElement('option');
+      option.value = String(item.id || item.job_id || '');
+      option.textContent = mapLabel(item);
+      selectEl.appendChild(option);
+    });
+    if (prev && list.some((item) => String(item.id || item.job_id || '') === String(prev))) {
+      selectEl.value = prev;
+    }
+  };
+
+  fillSelect(
+    cameraSourceJobSelect,
+    '选择换脸源任务（换脸模式必选）',
+    swapSourceOptions,
+    (item) => `${item.task_name} | ${displayScenario(item.attention_scenario)} | ${formatTime(item.created_at)}`,
+  );
 }
 
 function drawAttentionCurve(curveData) {
@@ -1242,6 +1843,7 @@ async function loadJobs() {
     if (job.status === 'completed') {
       if (job.output_model_path) addJobActionButton(resultsCell, '关键帧OBJ', 'small', `/reconstructions/${job.id}/download`);
       if (job.output_preview_path) addJobActionButton(resultsCell, '关键帧预览', 'small secondary', `/reconstructions/${job.id}/preview`);
+      if (job.output_sequence_zip_path) addJobActionButton(resultsCell, '序列OBJ ZIP', 'small secondary', `/reconstructions/${job.id}/sequence`);
       if (job.media_type === 'photo' && job.output_preview_path) {
         const inlinePreviewBtn = document.createElement('button');
         inlinePreviewBtn.className = 'small secondary';
@@ -1455,6 +2057,9 @@ async function enterApp() {
     await loadMedia();
     await loadJobs();
     await loadAttentionJobOptions();
+    try {
+      await loadFaceSwapOptions();
+    } catch (_) {}
     await loadUsersAdmin();
     await loadAuditLogs();
 
@@ -1467,6 +2072,8 @@ async function enterApp() {
     setToken('');
     closeAllJobEventStreams();
     closeImagePreviewModal();
+    stopCameraStream();
+    resetCameraAnalysisPanel();
     authPanel.classList.remove('hidden');
     appPanel.classList.add('hidden');
     adminPanel.classList.add('hidden');
@@ -1632,6 +2239,9 @@ deleteAccountForm.addEventListener('submit', async (e) => {
     closeAllJobEventStreams();
     closeFramePreviewModal();
     closeImagePreviewModal();
+    stopCameraStream();
+    resetCameraAnalysisPanel();
+    resetPhotoAnalysisPreview();
     adminNavBtn.classList.add('hidden');
     adminPanel.classList.add('hidden');
     downloadAttentionCsvBtn.disabled = true;
@@ -1673,7 +2283,13 @@ document.getElementById('realtime-attention-form').addEventListener('submit', as
       method: 'POST',
       body: fd,
     });
-    renderRealtimeAttention(result);
+    renderRealtimeAttention({
+      ...result,
+      previewImageUrl: URL.createObjectURL(file),
+      previewTitle: '照片分析图片',
+      previewMeta: `文件：${file.name} | 场景：${displayScenario(result.scenario || scenario)} | 模式：${displayMode(result.mode || mode)}`,
+      previewOwnsUrl: true,
+    });
     setMsg(appMsg, '照片分析完成', 'ok');
   } catch (err) {
     setMsg(appMsg, err.message, 'error');
@@ -1686,6 +2302,70 @@ document.getElementById('attention-job-form').addEventListener('submit', async (
   if (!jobId) return;
   await loadAttentionForJob(jobId, false);
 });
+
+if (cameraRunModeSelect) {
+  cameraRunModeSelect.addEventListener('change', () => {
+    const isSwap = cameraRunModeSelect.value === 'swap';
+    if (cameraSourceJobSelect) cameraSourceJobSelect.disabled = !isSwap;
+    if (cameraSourceFaceIndexInput) cameraSourceFaceIndexInput.disabled = !isSwap;
+    if (cameraTargetFaceIndexInput) cameraTargetFaceIndexInput.disabled = !isSwap;
+    if (!isSwap) {
+      setCameraRuntimeText('当前为仅解析模式');
+      clearCameraLock();
+      drawCameraOverlay();
+    }
+  });
+  cameraRunModeSelect.dispatchEvent(new Event('change'));
+}
+
+if (cameraStartBtn) {
+  cameraStartBtn.addEventListener('click', () => {
+    startCameraStream().catch((err) => {
+      setCameraRuntimeText(err.message, 'error');
+      if (cameraStartBtn) cameraStartBtn.disabled = false;
+      if (cameraStopBtn) cameraStopBtn.disabled = true;
+    });
+  });
+}
+
+if (cameraStopBtn) {
+  cameraStopBtn.addEventListener('click', () => {
+    stopCameraStream();
+  });
+}
+
+if (cameraClearLockBtn) {
+  cameraClearLockBtn.addEventListener('click', () => {
+    clearCameraLock();
+  });
+}
+
+if (cameraVideoEl) {
+  cameraVideoEl.addEventListener('click', (event) => {
+    lockFaceByClick(event, cameraVideoEl);
+  });
+}
+
+if (cameraProcessedImage) {
+  cameraProcessedImage.addEventListener('click', (event) => {
+    lockFaceByClick(event, cameraProcessedImage);
+  });
+  cameraProcessedImage.addEventListener('load', () => {
+    drawCameraOverlay();
+  });
+}
+
+if (cameraOverlayCanvas) {
+  cameraOverlayCanvas.addEventListener('click', (event) => {
+    lockFaceByClick(event, cameraOverlayCanvas);
+  });
+}
+
+if (cameraVideoEl) {
+  cameraVideoEl.addEventListener('loadedmetadata', () => {
+    drawCameraOverlay();
+  });
+}
 
 downloadAttentionCsvBtn.addEventListener('click', () => {
   if (!currentAttentionJobId) return;
@@ -1701,6 +2381,8 @@ document.getElementById('logout-btn').addEventListener('click', () => {
   closeAllJobEventStreams();
   closeFramePreviewModal();
   closeImagePreviewModal();
+  stopCameraStream();
+  resetCameraAnalysisPanel();
   adminNavBtn.classList.add('hidden');
   downloadAttentionCsvBtn.disabled = true;
   setMsg(appMsg, '');
@@ -1772,6 +2454,7 @@ document.getElementById('refresh-jobs').addEventListener('click', () => {
   Promise.all([
     loadJobs(),
     loadAttentionJobOptions(),
+    loadFaceSwapOptions(),
   ]).catch((err) => setMsg(appMsg, err.message, 'error'));
 });
 
@@ -1882,6 +2565,9 @@ appNavButtons.forEach((btn) => {
     if (viewId === 'view-attention') {
       loadAttentionJobOptions().catch(() => {});
     }
+    if (viewId === 'view-camera-swap') {
+      loadFaceSwapOptions().catch(() => {});
+    }
   });
 });
 
@@ -1892,5 +2578,10 @@ switchAuthTab('login');
 drawAttentionCurve({ points: [] });
 window.addEventListener('resize', () => {
   drawAttentionCurve(lastAttentionCurveData);
+  drawCameraOverlay();
+});
+window.addEventListener('beforeunload', () => {
+  stopCameraStream();
+  closeAllJobEventStreams();
 });
 enterApp();

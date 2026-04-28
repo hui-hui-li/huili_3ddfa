@@ -7,7 +7,7 @@ from typing import Dict, Optional
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
 
 from app.core.schemas import RealtimeAttentionFace, RealtimeAttentionResponse
-from app.services.reconstruction import analyze_attention_frame
+from app.services.reconstruction import analyze_attention_frame, pose_matches_scenario
 
 
 router = APIRouter(prefix="/attention", tags=["attention"])
@@ -90,6 +90,10 @@ def analyze_frame(
             pitch=float(face.get("pitch", 0.0)),
             roll=float(face.get("roll", 0.0)),
             attention_score=float(face.get("attention_score", 0.0)),
+            bbox_x=(float(face.get("bbox_x")) if face.get("bbox_x") is not None else None),
+            bbox_y=(float(face.get("bbox_y")) if face.get("bbox_y") is not None else None),
+            bbox_w=(float(face.get("bbox_w")) if face.get("bbox_w") is not None else None),
+            bbox_h=(float(face.get("bbox_h")) if face.get("bbox_h") is not None else None),
             head_down=bool(face.get("head_down", False)),
             side_view=bool(face.get("side_view", False)),
             tilted=bool(face.get("tilted", False)),
@@ -100,11 +104,15 @@ def analyze_frame(
 
     face_count = len(face_models)
     avg_attention = 0.0
-    head_up_rate = 0.0
+    pose_match_rate = 0.0
     if face_count > 0:
         avg_attention = sum(face.attention_score for face in face_models) / float(face_count)
-        head_up_rate = (
-            sum(1 for face in face_models if (not face.head_down and not face.side_view)) / float(face_count)
+        pose_match_rate = (
+            sum(
+                1
+                for face in face_models
+                if pose_matches_scenario(face.yaw, face.pitch, face.roll, scenario)
+            ) / float(face_count)
         ) * 100.0
 
     _cleanup_states()
@@ -114,6 +122,6 @@ def analyze_frame(
         timestamp=datetime.utcnow(),
         face_count=face_count,
         avg_attention=round(avg_attention, 4),
-        classroom_head_up_rate=round(head_up_rate, 4),
+        classroom_head_up_rate=round(pose_match_rate, 4),
         faces=face_models,
     )

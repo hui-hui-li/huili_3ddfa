@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>3D 人脸重建与注意力分析平台</title>
-  <link rel="stylesheet" href="/styles.css?v=20260319-2" />
+  <link rel="stylesheet" href="/styles.css?v=20260319-4" />
 </head>
 <body>
   <div class="bg"></div>
@@ -53,6 +53,7 @@
         <button class="app-nav-btn" data-view="view-jobs">重建任务</button>
         <button class="app-nav-btn" data-view="view-photo-analysis">照片分析</button>
         <button class="app-nav-btn" data-view="view-attention">注意力分析</button>
+        <button class="app-nav-btn" data-view="view-camera-swap">摄像头换脸</button>
         <button class="app-nav-btn" data-view="view-profile">个人资料</button>
         <button id="admin-nav-btn" class="app-nav-btn hidden" data-view="view-admin">管理员</button>
       </nav>
@@ -203,6 +204,16 @@
             <button type="submit">分析</button>
           </form>
           <p id="realtime-attention-summary" class="muted" style="margin-top:10px;">尚未分析</p>
+          <div id="photo-analysis-preview" class="photo-analysis-preview hidden">
+            <div class="section-head">
+              <h4>对应图片</h4>
+              <button id="photo-analysis-preview-open" type="button" class="small secondary">查看大图</button>
+            </div>
+            <div class="preview-stage photo-analysis-stage">
+              <img id="photo-analysis-image" alt="analysis source" />
+            </div>
+            <p id="photo-analysis-meta" class="muted"></p>
+          </div>
           <div class="table-wrap">
             <table>
               <thead>
@@ -265,6 +276,80 @@
             </table>
           </div>
         </article>
+      </section>
+
+      <section id="view-camera-swap" class="app-view hidden">
+        <article class="card">
+          <h3>摄像头实时解析与换脸</h3>
+          <p class="muted">支持摄像头实时注意力分析，也支持将已完成重建任务中的人脸外观替换到摄像头输入，动作与表情保持摄像头实时数据。</p>
+          <div class="feature-list muted">
+            <span>摄像头实时头姿态分析</span>
+            <span>摄像头实时外观替换</span>
+            <span>保留目标动作表情</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="section-head">
+            <h3>摄像头实时</h3>
+          </div>
+          <form id="camera-control-form" class="form inline-form">
+            <select id="camera-scenario">
+              <option value="classroom">课堂场景</option>
+              <option value="exam">考试场景</option>
+              <option value="driving">驾驶场景</option>
+            </select>
+            <select id="camera-mode">
+              <option value="single">单人分析</option>
+              <option value="multi">多人分析</option>
+            </select>
+            <select id="camera-run-mode">
+              <option value="analyze">仅解析</option>
+              <option value="swap">解析 + 换脸</option>
+            </select>
+            <select id="camera-source-job">
+              <option value="">选择换脸源任务（换脸模式必选）</option>
+            </select>
+            <input id="camera-source-face-index" type="number" min="0" max="12" value="0" placeholder="源脸索引" />
+            <input id="camera-target-face-index" type="number" min="0" max="12" value="0" placeholder="目标脸索引" />
+            <label class="muted">采样间隔(ms)
+              <input id="camera-interval-ms" type="number" min="120" max="3000" step="20" value="420" />
+            </label>
+            <button id="camera-start-btn" type="button">启动摄像头</button>
+            <button id="camera-stop-btn" type="button" class="small warn" disabled>停止</button>
+            <button id="camera-clear-lock-btn" type="button" class="small secondary">清除锁定</button>
+          </form>
+          <p id="camera-runtime-status" class="muted" style="margin-top:10px;">摄像头未启动</p>
+          <p id="camera-lock-status" class="muted">当前未手动锁定人脸</p>
+          <div class="camera-stage-grid">
+            <div class="preview-stage camera-stage">
+              <video id="camera-video" autoplay muted playsinline></video>
+            </div>
+            <div class="preview-stage camera-stage camera-output-stage">
+              <img id="camera-processed-image" alt="camera processed output" />
+              <canvas id="camera-overlay-canvas"></canvas>
+            </div>
+          </div>
+          <p id="camera-analysis-summary" class="muted">尚未开始实时分析</p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>人脸</th>
+                  <th>偏航角</th>
+                  <th>俯仰角</th>
+                  <th>翻滚角</th>
+                  <th>专注度</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="camera-attention-body">
+                <tr><td colspan="6">尚未开始</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
       </section>
 
       <section id="view-profile" class="app-view hidden">
@@ -387,6 +472,6 @@
     </div>
   </section>
 
-  <script src="/app.js?v=20260319-2"></script>
+  <script src="/app.js?v=20260319-4"></script>
 </body>
 </html>
